@@ -24,6 +24,7 @@ function Initialize-BleWatcherBridge {
     $winMetadataDirectory = Join-Path $env:windir 'System32\WinMetadata'
     $references = @(
         (Join-Path $runtimeDirectory 'System.Runtime.WindowsRuntime.dll'),
+        (Join-Path $runtimeDirectory 'Facades\System.Runtime.dll'),
         (Join-Path $winMetadataDirectory 'Windows.Foundation.winmd'),
         (Join-Path $winMetadataDirectory 'Windows.Devices.winmd')
     )
@@ -180,12 +181,12 @@ namespace XXPhoneInputGuardBleV1
         '/nologo',
         '/target:library',
         '/optimize+',
-        (('/out:{0}' -f $assemblyPath)),
-        (('/reference:{0}' -f $references[0])),
-        (('/reference:{0}' -f $references[1])),
-        (('/reference:{0}' -f $references[2])),
-        $sourcePath
+        (('/out:{0}' -f $assemblyPath))
     )
+    foreach ($reference in $references) {
+        $compilerArguments += ('/reference:{0}' -f $reference)
+    }
+    $compilerArguments += $sourcePath
     $compilerOutput = @(& $compiler @compilerArguments 2>&1 |
         ForEach-Object { $_.ToString() })
     if (($LASTEXITCODE -ne 0) -or -not (Test-Path -LiteralPath $assemblyPath)) {
