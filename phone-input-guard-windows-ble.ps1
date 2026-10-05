@@ -49,7 +49,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$Script:GuardVersion = '2.0.0'
+$Script:GuardVersion = '2.0.1'
 $Script:InstallRoot = Join-Path $env:LOCALAPPDATA 'KIDZ'
 $Script:InstalledScript = Join-Path $Script:InstallRoot 'phone-input-guard-windows-ble.ps1'
 $Script:ConfigPath = Join-Path $Script:InstallRoot 'windows-ble-config.json'
@@ -94,6 +94,7 @@ function Initialize-NativeMethods {
     $source = @'
 using System;
 using System.Runtime.InteropServices;
+using System.Threading;
 
 namespace XXPhoneInputGuardV2
 {
@@ -110,9 +111,65 @@ namespace XXPhoneInputGuardV2
             public uint BatteryFullLifeTime;
         }
 
-        [DllImport("user32.dll", EntryPoint = "BlockInput", SetLastError = true)]
+        [StructLayout(LayoutKind.Sequential)]
+        private struct POINT
+        {
+            public int X;
+            public int Y;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct MSG
+        {
+            public IntPtr Hwnd;
+            public uint Message;
+            public UIntPtr WParam;
+            public IntPtr LParam;
+            public uint Time;
+            public POINT Point;
+            public uint Private;
+        }
+
+        private delegate IntPtr LowLevelHookProc(int code, IntPtr wParam, IntPtr lParam);
+
+        [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        private static extern IntPtr SetWindowsHookEx(
+            int hookId, LowLevelHookProc callback, IntPtr module, uint threadId);
+
+        [DllImport("user32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool BlockInputNative([MarshalAs(UnmanagedType.Bool)] bool block);
+        private static extern bool UnhookWindowsHookEx(IntPtr hook);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr CallNextHookEx(
+            IntPtr hook, int code, IntPtr wParam, IntPtr lParam);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern int GetMessage(
+            out MSG message, IntPtr window, uint minimum, uint maximum);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool TranslateMessage(ref MSG message);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr DispatchMessage(ref MSG message);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool PostThreadMessage(
+            uint threadId, uint message, UIntPtr wParam, IntPtr lParam);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool PeekMessage(
+            out MSG message, IntPtr window, uint minimum, uint maximum, uint removeMessage);
+
+        [DllImport("kernel32.dll")]
+        private static extern uint GetCurrentThreadId();
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        private static extern IntPtr GetModuleHandle(string moduleName);
 
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern uint SetThreadExecutionState(uint executionState);
@@ -124,15 +181,163 @@ namespace XXPhoneInputGuardV2
         private const uint ES_CONTINUOUS = 0x80000000;
         private const uint ES_SYSTEM_REQUIRED = 0x00000001;
         private const uint ES_DISPLAY_REQUIRED = 0x00000002;
+        private const int WH_KEYBOARD_LL = 13;
+        private const int WH_MOUSE_LL = 14;
+        private const uint WM_QUIT = 0x0012;
+        private const uint PM_NOREMOVE = 0x0000;
+
+        private static readonly object HookSync = new object();
+        private static readonly ManualResetEvent HookReady = new ManualResetEvent(false);
+        private static readonly LowLevelHookProc KeyboardProcedure = KeyboardHook;
+        private static readonly LowLevelHookProc MouseProcedure = MouseHook;
+        private static Thread hookThread;
+        private static IntPtr keyboardHook = IntPtr.Zero;
+        private static IntPtr mouseHook = IntPtr.Zero;
+        private static uint hookThreadId;
+        private static volatile bool suppressInput;
+        private static int hookError;
+
+        private static IntPtr KeyboardHook(int code, IntPtr wParam, IntPtr lParam)
+        {
+            if (code >= 0 && suppressInput)
+                return new IntPtr(1);
+            return CallNextHookEx(IntPtr.Zero, code, wParam, lParam);
+        }
+
+        private static IntPtr MouseHook(int code, IntPtr wParam, IntPtr lParam)
+        {
+            if (code >= 0 && suppressInput)
+                return new IntPtr(1);
+            return CallNextHookEx(IntPtr.Zero, code, wParam, lParam);
+        }
+
+        private static IntPtr InstallHook(
+            int hookId, LowLevelHookProc callback, IntPtr module)
+        {
+            IntPtr hook = SetWindowsHookEx(hookId, callback, module, 0);
+            if (hook == IntPtr.Zero && module != IntPtr.Zero)
+                hook = SetWindowsHookEx(hookId, callback, IntPtr.Zero, 0);
+            return hook;
+        }
+
+        private static void HookThreadMain()
+        {
+            try
+            {
+                hookThreadId = GetCurrentThreadId();
+                MSG initialMessage;
+                PeekMessage(out initialMessage, IntPtr.Zero, 0, 0, PM_NOREMOVE);
+
+                IntPtr module = GetModuleHandle(null);
+                keyboardHook = InstallHook(WH_KEYBOARD_LL, KeyboardProcedure, module);
+                if (keyboardHook == IntPtr.Zero)
+                {
+                    hookError = Marshal.GetLastWin32Error();
+                    return;
+                }
+
+                mouseHook = InstallHook(WH_MOUSE_LL, MouseProcedure, module);
+                if (mouseHook == IntPtr.Zero)
+                {
+                    hookError = Marshal.GetLastWin32Error();
+                    return;
+                }
+
+                HookReady.Set();
+                MSG message;
+                int result;
+                while ((result = GetMessage(out message, IntPtr.Zero, 0, 0)) > 0)
+                {
+                    TranslateMessage(ref message);
+                    DispatchMessage(ref message);
+                }
+                if (result < 0)
+                    hookError = Marshal.GetLastWin32Error();
+            }
+            finally
+            {
+                suppressInput = false;
+                if (mouseHook != IntPtr.Zero)
+                    UnhookWindowsHookEx(mouseHook);
+                if (keyboardHook != IntPtr.Zero)
+                    UnhookWindowsHookEx(keyboardHook);
+
+                lock (HookSync)
+                {
+                    mouseHook = IntPtr.Zero;
+                    keyboardHook = IntPtr.Zero;
+                    hookThreadId = 0;
+                    hookThread = null;
+                }
+                HookReady.Set();
+            }
+        }
+
+        private static bool StartHooks()
+        {
+            Thread threadToStart;
+            lock (HookSync)
+            {
+                if (hookThread != null && hookThread.IsAlive &&
+                    keyboardHook != IntPtr.Zero && mouseHook != IntPtr.Zero)
+                {
+                    suppressInput = true;
+                    return true;
+                }
+
+                hookError = 0;
+                suppressInput = true;
+                HookReady.Reset();
+                hookThread = new Thread(HookThreadMain);
+                hookThread.IsBackground = true;
+                hookThread.Name = "XX input-blocking hooks";
+                threadToStart = hookThread;
+            }
+
+            threadToStart.Start();
+            if (!HookReady.WaitOne(3000))
+            {
+                suppressInput = false;
+                hookError = 1460;
+                return false;
+            }
+
+            lock (HookSync)
+            {
+                bool installed = keyboardHook != IntPtr.Zero && mouseHook != IntPtr.Zero;
+                if (!installed)
+                    suppressInput = false;
+                return installed;
+            }
+        }
+
+        private static bool StopHooks()
+        {
+            Thread threadToStop;
+            uint threadId;
+            suppressInput = false;
+            lock (HookSync)
+            {
+                threadToStop = hookThread;
+                threadId = hookThreadId;
+            }
+
+            if (threadId != 0)
+                PostThreadMessage(threadId, WM_QUIT, UIntPtr.Zero, IntPtr.Zero);
+            if (threadToStop != null && threadToStop.IsAlive &&
+                threadToStop != Thread.CurrentThread)
+                threadToStop.Join(2000);
+            return true;
+        }
 
         public static bool BlockInput(bool block)
         {
-            return BlockInputNative(block);
+            return block ? StartHooks() : StopHooks();
         }
 
         public static int GetLastError()
         {
-            return Marshal.GetLastWin32Error();
+            return hookError;
         }
 
         public static bool SetKeepAwake(bool enabled)
@@ -868,7 +1073,7 @@ function Invoke-GuardLoop {
                         $inputBlocked = $true
                     }
                     elseif (-not $inputBlocked) {
-                        Write-GuardLog ('BlockInput failed; Win32 error {0}.' -f
+                        Write-GuardLog ('Input hooks failed; Win32 error {0}.' -f
                             [XXPhoneInputGuardV2.NativeMethods]::GetLastError())
                     }
                     $lastBlockAssert = $now
@@ -988,7 +1193,7 @@ function Invoke-SelfTest {
     try {
         $blocked = [XXPhoneInputGuardV2.NativeMethods]::BlockInput($true)
         if (-not $blocked) {
-            throw ('BlockInput was denied; Win32 error {0}. This Windows account may require elevation.' -f
+            throw ('Input hooks could not be installed; Win32 error {0}.' -f
                 [XXPhoneInputGuardV2.NativeMethods]::GetLastError())
         }
         Start-Sleep -Milliseconds 250
@@ -996,7 +1201,7 @@ function Invoke-SelfTest {
     finally {
         [void][XXPhoneInputGuardV2.NativeMethods]::BlockInput($false)
     }
-    Write-Host 'BlockInput self-test passed; input was released.' -ForegroundColor Green
+    Write-Host 'Non-admin input-hook self-test passed; input was released.' -ForegroundColor Green
 }
 
 function Arm-Guard {
