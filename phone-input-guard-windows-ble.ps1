@@ -49,7 +49,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$Script:GuardVersion = '2.0.1'
+$Script:GuardVersion = '2.0.2'
 $Script:InstallRoot = Join-Path $env:LOCALAPPDATA 'KIDZ'
 $Script:InstalledScript = Join-Path $Script:InstallRoot 'phone-input-guard-windows-ble.ps1'
 $Script:ConfigPath = Join-Path $Script:InstallRoot 'windows-ble-config.json'
@@ -87,7 +87,7 @@ function Write-GuardLog {
 }
 
 function Initialize-NativeMethods {
-    if ('XXPhoneInputGuardV2.NativeMethods' -as [type]) {
+    if ('XXPhoneInputGuardV3.NativeMethods' -as [type]) {
         return
     }
 
@@ -96,7 +96,7 @@ using System;
 using System.Runtime.InteropServices;
 using System.Threading;
 
-namespace XXPhoneInputGuardV2
+namespace XXPhoneInputGuardV3
 {
     public static class NativeMethods
     {
@@ -132,7 +132,7 @@ namespace XXPhoneInputGuardV2
 
         private delegate IntPtr LowLevelHookProc(int code, IntPtr wParam, IntPtr lParam);
 
-        [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        [DllImport("user32.dll", EntryPoint = "SetWindowsHookExW", SetLastError = true)]
         private static extern IntPtr SetWindowsHookEx(
             int hookId, LowLevelHookProc callback, IntPtr module, uint threadId);
 
@@ -168,9 +168,6 @@ namespace XXPhoneInputGuardV2
         [DllImport("kernel32.dll")]
         private static extern uint GetCurrentThreadId();
 
-        [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
-        private static extern IntPtr GetModuleHandle(string moduleName);
-
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern uint SetThreadExecutionState(uint executionState);
 
@@ -196,6 +193,7 @@ namespace XXPhoneInputGuardV2
         private static uint hookThreadId;
         private static volatile bool suppressInput;
         private static int hookError;
+        private static string hookStage = "not started";
 
         private static IntPtr KeyboardHook(int code, IntPtr wParam, IntPtr lParam)
         {
@@ -211,38 +209,45 @@ namespace XXPhoneInputGuardV2
             return CallNextHookEx(IntPtr.Zero, code, wParam, lParam);
         }
 
-        private static IntPtr InstallHook(
-            int hookId, LowLevelHookProc callback, IntPtr module)
-        {
-            IntPtr hook = SetWindowsHookEx(hookId, callback, module, 0);
-            if (hook == IntPtr.Zero && module != IntPtr.Zero)
-                hook = SetWindowsHookEx(hookId, callback, IntPtr.Zero, 0);
-            return hook;
-        }
-
         private static void HookThreadMain()
         {
             try
             {
                 hookThreadId = GetCurrentThreadId();
+                hookStage = "creating the hook message queue";
                 MSG initialMessage;
                 PeekMessage(out initialMessage, IntPtr.Zero, 0, 0, PM_NOREMOVE);
 
-                IntPtr module = GetModuleHandle(null);
-                keyboardHook = InstallHook(WH_KEYBOARD_LL, KeyboardProcedure, module);
+                // A global hook must identify the DLL that contains its procedure.
+                // The PowerShell host module is not that DLL, so use this compiled
+                // assembly's actual module handle.
+                hookStage = "resolving the compiled hook DLL";
+                IntPtr module = Marshal.GetHINSTANCE(typeof(NativeMethods).Module);
+                if (module == IntPtr.Zero || module == new IntPtr(-1))
+                {
+                    hookError = 126;
+                    return;
+                }
+
+                hookStage = "installing the keyboard hook";
+                keyboardHook = SetWindowsHookEx(
+                    WH_KEYBOARD_LL, KeyboardProcedure, module, 0);
                 if (keyboardHook == IntPtr.Zero)
                 {
                     hookError = Marshal.GetLastWin32Error();
                     return;
                 }
 
-                mouseHook = InstallHook(WH_MOUSE_LL, MouseProcedure, module);
+                hookStage = "installing the mouse hook";
+                mouseHook = SetWindowsHookEx(
+                    WH_MOUSE_LL, MouseProcedure, module, 0);
                 if (mouseHook == IntPtr.Zero)
                 {
                     hookError = Marshal.GetLastWin32Error();
                     return;
                 }
 
+                hookStage = "active";
                 HookReady.Set();
                 MSG message;
                 int result;
@@ -286,6 +291,7 @@ namespace XXPhoneInputGuardV2
                 }
 
                 hookError = 0;
+                hookStage = "starting the hook thread";
                 suppressInput = true;
                 HookReady.Reset();
                 hookThread = new Thread(HookThreadMain);
@@ -299,6 +305,7 @@ namespace XXPhoneInputGuardV2
             {
                 suppressInput = false;
                 hookError = 1460;
+                hookStage = "waiting for the hook thread";
                 return false;
             }
 
@@ -340,6 +347,11 @@ namespace XXPhoneInputGuardV2
             return hookError;
         }
 
+        public static string GetHookStage()
+        {
+            return hookStage;
+        }
+
         public static bool SetKeepAwake(bool enabled)
         {
             uint flags = ES_CONTINUOUS;
@@ -360,7 +372,33 @@ namespace XXPhoneInputGuardV2
 }
 '@
 
-    Add-Type -TypeDefinition $source -Language CSharp
+    $compilerCandidates = @(
+        (Join-Path $env:windir 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'),
+        (Join-Path $env:windir 'Microsoft.NET\Framework\v4.0.30319\csc.exe')
+    )
+    $compiler = $compilerCandidates |
+        Where-Object { Test-Path -LiteralPath $_ } |
+        Select-Object -First 1
+    if ($null -eq $compiler) {
+        throw 'The built-in .NET Framework C# compiler (csc.exe) is unavailable.'
+    }
+
+    $buildDirectory = Join-Path ([IO.Path]::GetTempPath()) (
+        'XXPhoneInputGuardNativeV3-' + [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $buildDirectory -Force | Out-Null
+    $sourcePath = Join-Path $buildDirectory 'NativeMethods.cs'
+    $assemblyPath = Join-Path $buildDirectory 'NativeMethods.dll'
+    Set-Content -LiteralPath $sourcePath -Value $source -Encoding UTF8
+
+    $compilerOutput = @(& $compiler /nologo /target:library /optimize+ `
+        (('/out:{0}' -f $assemblyPath)) $sourcePath 2>&1 |
+        ForEach-Object { $_.ToString() })
+    if (($LASTEXITCODE -ne 0) -or -not (Test-Path -LiteralPath $assemblyPath)) {
+        throw ('Native input-hook compiler failed:' + [Environment]::NewLine +
+            ($compilerOutput -join [Environment]::NewLine))
+    }
+
+    Add-Type -LiteralPath $assemblyPath
 }
 
 function Initialize-BleWatcherBridge {
@@ -775,7 +813,7 @@ function Reset-PowerRescueState {
         [Parameter(Mandatory = $true)][long]$NowMilliseconds
     )
 
-    $ac = [XXPhoneInputGuardV2.NativeMethods]::GetACLineStatus()
+    $ac = [XXPhoneInputGuardV3.NativeMethods]::GetACLineStatus()
     $State.StableAC = $ac
     $State.CandidateAC = $ac
     $State.CandidateSince = $NowMilliseconds
@@ -790,7 +828,7 @@ function Update-PowerRescueState {
         [Parameter(Mandatory = $true)][long]$NowMilliseconds
     )
 
-    $rawAC = [XXPhoneInputGuardV2.NativeMethods]::GetACLineStatus()
+    $rawAC = [XXPhoneInputGuardV3.NativeMethods]::GetACLineStatus()
     if ($rawAC -lt 0) {
         return $false
     }
@@ -1007,7 +1045,7 @@ function Invoke-GuardLoop {
     $banner = New-GuardBanner -Text ([string]$config.banner_text)
     $clock = [Diagnostics.Stopwatch]::StartNew()
     $presence = New-PresenceState
-    $initialAC = [XXPhoneInputGuardV2.NativeMethods]::GetACLineStatus()
+    $initialAC = [XXPhoneInputGuardV3.NativeMethods]::GetACLineStatus()
     $powerState = @{
         StableAC       = $initialAC
         CandidateAC    = $initialAC
@@ -1068,13 +1106,14 @@ function Invoke-GuardLoop {
             $shouldBlock = $baseRisk -and (-not $rescueActive)
             if ($shouldBlock) {
                 if ((-not $inputBlocked) -or (($now - $lastBlockAssert) -ge 1000)) {
-                    $blockedNow = [XXPhoneInputGuardV2.NativeMethods]::BlockInput($true)
+                    $blockedNow = [XXPhoneInputGuardV3.NativeMethods]::BlockInput($true)
                     if ($blockedNow) {
                         $inputBlocked = $true
                     }
                     elseif (-not $inputBlocked) {
-                        Write-GuardLog ('Input hooks failed; Win32 error {0}.' -f
-                            [XXPhoneInputGuardV2.NativeMethods]::GetLastError())
+                        Write-GuardLog ('Input hooks failed while {0}; Win32 error {1}.' -f
+                            [XXPhoneInputGuardV3.NativeMethods]::GetHookStage(),
+                            [XXPhoneInputGuardV3.NativeMethods]::GetLastError())
                     }
                     $lastBlockAssert = $now
                 }
@@ -1083,17 +1122,17 @@ function Invoke-GuardLoop {
                     $banner.BringToFront()
                     $banner.Refresh()
                 }
-                [void][XXPhoneInputGuardV2.NativeMethods]::SetKeepAwake($true)
+                [void][XXPhoneInputGuardV3.NativeMethods]::SetKeepAwake($true)
             }
             else {
                 if ($banner.Visible) {
                     $banner.Hide()
                 }
                 if ($inputBlocked) {
-                    [void][XXPhoneInputGuardV2.NativeMethods]::BlockInput($false)
+                    [void][XXPhoneInputGuardV3.NativeMethods]::BlockInput($false)
                     $inputBlocked = $false
                 }
-                [void][XXPhoneInputGuardV2.NativeMethods]::SetKeepAwake($false)
+                [void][XXPhoneInputGuardV3.NativeMethods]::SetKeepAwake($false)
             }
 
             if (($null -eq $lastRisk) -or ([bool]$baseRisk -ne [bool]$lastRisk)) {
@@ -1131,8 +1170,8 @@ function Invoke-GuardLoop {
         throw
     }
     finally {
-        [void][XXPhoneInputGuardV2.NativeMethods]::BlockInput($false)
-        [void][XXPhoneInputGuardV2.NativeMethods]::SetKeepAwake($false)
+        [void][XXPhoneInputGuardV3.NativeMethods]::BlockInput($false)
+        [void][XXPhoneInputGuardV3.NativeMethods]::SetKeepAwake($false)
         if ($null -ne $banner) {
             $banner.Close()
             $banner.Dispose()
@@ -1191,15 +1230,16 @@ function Invoke-SelfTest {
     Initialize-NativeMethods
     $blocked = $false
     try {
-        $blocked = [XXPhoneInputGuardV2.NativeMethods]::BlockInput($true)
+        $blocked = [XXPhoneInputGuardV3.NativeMethods]::BlockInput($true)
         if (-not $blocked) {
-            throw ('Input hooks could not be installed; Win32 error {0}.' -f
-                [XXPhoneInputGuardV2.NativeMethods]::GetLastError())
+            throw ('Input hooks could not be installed while {0}; Win32 error {1}.' -f
+                [XXPhoneInputGuardV3.NativeMethods]::GetHookStage(),
+                [XXPhoneInputGuardV3.NativeMethods]::GetLastError())
         }
         Start-Sleep -Milliseconds 250
     }
     finally {
-        [void][XXPhoneInputGuardV2.NativeMethods]::BlockInput($false)
+        [void][XXPhoneInputGuardV3.NativeMethods]::BlockInput($false)
     }
     Write-Host 'Non-admin input-hook self-test passed; input was released.' -ForegroundColor Green
 }
