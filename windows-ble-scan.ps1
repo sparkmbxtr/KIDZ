@@ -48,7 +48,6 @@ function Initialize-BleWatcherBridge {
     $source = @'
 using System;
 using System.Collections.Generic;
-using System.Runtime.InteropServices.WindowsRuntime;
 using System.Threading;
 using Windows.Devices.Bluetooth.Advertisement;
 
@@ -68,7 +67,6 @@ namespace XXPhoneInputGuardBleV1
         private readonly Queue<BleSample> samples = new Queue<BleSample>();
         private readonly Guid targetUuid;
         private readonly BluetoothLEAdvertisementWatcher watcher;
-        private readonly EventRegistrationToken receivedToken;
         private int totalPackets;
         private int matchingPackets;
         private bool disposed;
@@ -78,7 +76,7 @@ namespace XXPhoneInputGuardBleV1
             this.targetUuid = targetUuid;
             watcher = new BluetoothLEAdvertisementWatcher();
             watcher.ScanningMode = BluetoothLEScanningMode.Active;
-            receivedToken = watcher.add_Received(OnReceived);
+            watcher.Received += OnReceived;
         }
 
         public string Status
@@ -154,7 +152,7 @@ namespace XXPhoneInputGuardBleV1
                 return;
 
             disposed = true;
-            watcher.remove_Received(receivedToken);
+            watcher.Received -= OnReceived;
             try
             {
                 watcher.Stop();
