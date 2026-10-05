@@ -25,6 +25,8 @@ function Initialize-BleWatcherBridge {
     try {
         $systemRuntimeReference = [Reflection.Assembly]::Load(
             'System.Runtime, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a').Location
+        $winRtInteropFacadeReference = [Reflection.Assembly]::Load(
+            'System.Runtime.InteropServices.WindowsRuntime, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a').Location
     }
     catch {
         throw ('The .NET System.Runtime facade is unavailable: ' + $_.Exception.Message)
@@ -32,6 +34,7 @@ function Initialize-BleWatcherBridge {
     $references = @(
         (Join-Path $runtimeDirectory 'System.Runtime.WindowsRuntime.dll'),
         $systemRuntimeReference,
+        $winRtInteropFacadeReference,
         (Join-Path $winMetadataDirectory 'Windows.Foundation.winmd'),
         (Join-Path $winMetadataDirectory 'Windows.Devices.winmd')
     )
