@@ -43,7 +43,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$Script:GuardVersion = '1.0.0'
+$Script:GuardVersion = '1.0.1'
 $Script:TaskName = 'XX Phone Input Guard'
 $Script:InstallRoot = Join-Path $env:ProgramData 'XX\PhoneInputGuard'
 $Script:InstalledScript = Join-Path $Script:InstallRoot 'phone-input-guard-windows.ps1'
@@ -187,7 +187,7 @@ namespace XXPhoneInputGuard
             public uint BatteryFullLifeTime;
         }
 
-        [DllImport("user32.dll", SetLastError = true)]
+        [DllImport("user32.dll", EntryPoint = "BlockInput", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
         private static extern bool BlockInputNative([MarshalAs(UnmanagedType.Bool)] bool block);
 
