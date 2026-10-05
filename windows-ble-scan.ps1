@@ -154,7 +154,46 @@ namespace XXPhoneInputGuardBleV1
 }
 '@
 
-    Add-Type -TypeDefinition $source -Language CSharp -ReferencedAssemblies $references
+    # Windows PowerShell 5.1's Add-Type tries to load .winmd files as ordinary
+    # CLR assemblies before compiling and fails with 0x80131047.  The .NET
+    # Framework C# compiler understands WinRT metadata directly, so invoke it
+    # first and then load the resulting ordinary managed assembly.
+    $compilerCandidates = @(
+        (Join-Path $env:windir 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'),
+        (Join-Path $env:windir 'Microsoft.NET\Framework\v4.0.30319\csc.exe')
+    )
+    $compiler = $compilerCandidates |
+        Where-Object { Test-Path -LiteralPath $_ } |
+        Select-Object -First 1
+    if ($null -eq $compiler) {
+        throw 'The built-in .NET Framework C# compiler (csc.exe) is unavailable.'
+    }
+
+    $buildDirectory = Join-Path ([IO.Path]::GetTempPath()) (
+        'XXPhoneInputGuardBle-' + [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $buildDirectory -Force | Out-Null
+    $sourcePath = Join-Path $buildDirectory 'BleWatcherBridge.cs'
+    $assemblyPath = Join-Path $buildDirectory 'BleWatcherBridge.dll'
+    Set-Content -LiteralPath $sourcePath -Value $source -Encoding UTF8
+
+    $compilerArguments = @(
+        '/nologo',
+        '/target:library',
+        '/optimize+',
+        (('/out:{0}' -f $assemblyPath)),
+        (('/reference:{0}' -f $references[0])),
+        (('/reference:{0}' -f $references[1])),
+        (('/reference:{0}' -f $references[2])),
+        $sourcePath
+    )
+    $compilerOutput = @(& $compiler @compilerArguments 2>&1 |
+        ForEach-Object { $_.ToString() })
+    if (($LASTEXITCODE -ne 0) -or -not (Test-Path -LiteralPath $assemblyPath)) {
+        throw ('C# compiler failed:' + [Environment]::NewLine +
+            ($compilerOutput -join [Environment]::NewLine))
+    }
+
+    Add-Type -LiteralPath $assemblyPath
 }
 
 if ($env:OS -ne 'Windows_NT') {
