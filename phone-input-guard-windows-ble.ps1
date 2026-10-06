@@ -49,7 +49,8 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$Script:GuardVersion = '2.1.0'
+$Script:GuardVersion = '2.1.1'
+$Script:NativeMethodsType = $null
 $Script:InstallRoot = Join-Path $env:LOCALAPPDATA 'KIDZ'
 $Script:InstalledScript = Join-Path $Script:InstallRoot 'phone-input-guard-windows-ble.ps1'
 $Script:InputHookHelper = Join-Path $Script:InstallRoot 'windows-input-hook-helper.exe'
@@ -102,7 +103,12 @@ function Write-GuardLog {
 }
 
 function Initialize-NativeMethods {
-    if ('XXPhoneInputGuardV4.NativeMethods' -as [type]) {
+    if ($null -ne $Script:NativeMethodsType) {
+        return
+    }
+    $existingType = 'XXPhoneInputGuardV4.NativeMethods' -as [type]
+    if ($null -ne $existingType) {
+        $Script:NativeMethodsType = $existingType
         return
     }
 
@@ -625,7 +631,13 @@ namespace XXPhoneInputGuardV4
             ($compilerOutput -join [Environment]::NewLine))
     }
 
-    Add-Type -LiteralPath $assemblyPath
+    $loadedTypes = @(Add-Type -LiteralPath $assemblyPath -PassThru)
+    $Script:NativeMethodsType = $loadedTypes |
+        Where-Object { $_.FullName -eq 'XXPhoneInputGuardV4.NativeMethods' } |
+        Select-Object -First 1
+    if ($null -eq $Script:NativeMethodsType) {
+        throw 'The compiled native-method bridge loaded without its expected public type.'
+    }
 }
 
 function Initialize-BleWatcherBridge {
@@ -1040,7 +1052,8 @@ function Reset-PowerRescueState {
         [Parameter(Mandatory = $true)][long]$NowMilliseconds
     )
 
-    $ac = [XXPhoneInputGuardV4.NativeMethods]::GetACLineStatus()
+    $nativeMethods = $Script:NativeMethodsType
+    $ac = $nativeMethods::GetACLineStatus()
     $State.StableAC = $ac
     $State.CandidateAC = $ac
     $State.CandidateSince = $NowMilliseconds
@@ -1055,7 +1068,8 @@ function Update-PowerRescueState {
         [Parameter(Mandatory = $true)][long]$NowMilliseconds
     )
 
-    $rawAC = [XXPhoneInputGuardV4.NativeMethods]::GetACLineStatus()
+    $nativeMethods = $Script:NativeMethodsType
+    $rawAC = $nativeMethods::GetACLineStatus()
     if ($rawAC -lt 0) {
         return $false
     }
@@ -1255,6 +1269,7 @@ function Invoke-GuardLoop {
     Initialize-NativeMethods
     Initialize-BleWatcherBridge
     Assert-InputHookHelper -Path $Script:InputHookHelper
+    $nativeMethods = $Script:NativeMethodsType
 
     if (-not (Test-Path -LiteralPath $Script:ArmedPath)) {
         return
@@ -1273,7 +1288,7 @@ function Invoke-GuardLoop {
     $banner = New-GuardBanner -Text ([string]$config.banner_text)
     $clock = [Diagnostics.Stopwatch]::StartNew()
     $presence = New-PresenceState
-    $initialAC = [XXPhoneInputGuardV4.NativeMethods]::GetACLineStatus()
+    $initialAC = $nativeMethods::GetACLineStatus()
     $powerState = @{
         StableAC       = $initialAC
         CandidateAC    = $initialAC
@@ -1334,15 +1349,15 @@ function Invoke-GuardLoop {
             $shouldBlock = $baseRisk -and (-not $rescueActive)
             if ($shouldBlock) {
                 if ((-not $inputBlocked) -or (($now - $lastBlockAssert) -ge 1000)) {
-                    $blockedNow = [XXPhoneInputGuardV4.NativeMethods]::StartInputBlocker(
+                    $blockedNow = $nativeMethods::StartInputBlocker(
                         $Script:InputHookHelper)
                     if ($blockedNow) {
                         $inputBlocked = $true
                     }
                     elseif (-not $inputBlocked) {
                         Write-GuardLog ('Native input helper failed while {0}; error {1}.' -f
-                            [XXPhoneInputGuardV4.NativeMethods]::GetBlockerStage(),
-                            [XXPhoneInputGuardV4.NativeMethods]::GetBlockerError())
+                            $nativeMethods::GetBlockerStage(),
+                            $nativeMethods::GetBlockerError())
                     }
                     $lastBlockAssert = $now
                 }
@@ -1351,17 +1366,17 @@ function Invoke-GuardLoop {
                     $banner.BringToFront()
                     $banner.Refresh()
                 }
-                [void][XXPhoneInputGuardV4.NativeMethods]::SetKeepAwake($true)
+                $null = $nativeMethods::SetKeepAwake($true)
             }
             else {
                 if ($banner.Visible) {
                     $banner.Hide()
                 }
                 if ($inputBlocked) {
-                    [void][XXPhoneInputGuardV4.NativeMethods]::StopInputBlocker()
+                    $null = $nativeMethods::StopInputBlocker()
                     $inputBlocked = $false
                 }
-                [void][XXPhoneInputGuardV4.NativeMethods]::SetKeepAwake($false)
+                $null = $nativeMethods::SetKeepAwake($false)
             }
 
             if (($null -eq $lastRisk) -or ([bool]$baseRisk -ne [bool]$lastRisk)) {
@@ -1399,8 +1414,8 @@ function Invoke-GuardLoop {
         throw
     }
     finally {
-        [void][XXPhoneInputGuardV4.NativeMethods]::StopInputBlocker()
-        [void][XXPhoneInputGuardV4.NativeMethods]::SetKeepAwake($false)
+        $null = $nativeMethods::StopInputBlocker()
+        $null = $nativeMethods::SetKeepAwake($false)
         if ($null -ne $banner) {
             $banner.Close()
             $banner.Dispose()
@@ -1470,19 +1485,20 @@ function Invoke-SelfTest {
     Assert-Windows
     Initialize-NativeMethods
     Assert-InputHookHelper -Path $Script:InputHookHelper
+    $nativeMethods = $Script:NativeMethodsType
     $blocked = $false
     try {
-        $blocked = [XXPhoneInputGuardV4.NativeMethods]::StartInputBlocker(
+        $blocked = $nativeMethods::StartInputBlocker(
             $Script:InputHookHelper)
         if (-not $blocked) {
             throw ('Native input helper failed while {0}; error {1}.' -f
-                [XXPhoneInputGuardV4.NativeMethods]::GetBlockerStage(),
-                [XXPhoneInputGuardV4.NativeMethods]::GetBlockerError())
+                $nativeMethods::GetBlockerStage(),
+                $nativeMethods::GetBlockerError())
         }
         Start-Sleep -Milliseconds 250
     }
     finally {
-        [void][XXPhoneInputGuardV4.NativeMethods]::StopInputBlocker()
+        $null = $nativeMethods::StopInputBlocker()
     }
     Write-Host 'Native non-admin input-hook self-test passed; input was released.' -ForegroundColor Green
 }
@@ -1617,7 +1633,10 @@ try {
             Assert-Windows
             Initialize-NativeMethods
             Initialize-BleWatcherBridge
-            Write-Host 'BLE guard bridges compiled successfully.' -ForegroundColor Green
+            $nativeMethods = $Script:NativeMethodsType
+            $acStatus = $nativeMethods::GetACLineStatus()
+            Write-Host ('BLE guard bridges compiled successfully; native bridge AC status={0}.' -f
+                $acStatus) -ForegroundColor Green
         }
     }
 }
