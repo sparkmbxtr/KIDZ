@@ -24,6 +24,7 @@ jobs:
         run: |
           foreach ($path in @(
               'phone-input-guard-windows.ps1',
+              'phone-input-guard-windows-ble.ps1',
               'windows-ble-scan.ps1')) {
             $tokens = $null
             $errors = $null
@@ -42,3 +43,4 @@ jobs:
           .\windows-ble-scan.ps1 `
             -ServiceUuid '00000000-0000-4000-8000-000000000000' `
             -CompileOnly
+          .\phone-input-guard-windows-ble.ps1 CompileOnly
