@@ -49,9 +49,11 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$Script:GuardVersion = '2.0.2'
+$Script:GuardVersion = '2.1.0'
 $Script:InstallRoot = Join-Path $env:LOCALAPPDATA 'KIDZ'
 $Script:InstalledScript = Join-Path $Script:InstallRoot 'phone-input-guard-windows-ble.ps1'
+$Script:InputHookHelper = Join-Path $Script:InstallRoot 'windows-input-hook-helper.exe'
+$Script:InputHookHelperSha256 = '0adc71ca80b19003db434b2bff0bf3dc63bb686d180095e67f6478c77d8c2d66'
 $Script:ConfigPath = Join-Path $Script:InstallRoot 'windows-ble-config.json'
 $Script:LogPath = Join-Path $Script:InstallRoot 'windows-ble-guard.log'
 $Script:StatePath = Join-Path $Script:InstallRoot 'windows-ble-state.json'
@@ -64,6 +66,19 @@ $Script:RunValueName = 'KIDZ Phone Input Guard'
 function Assert-Windows {
     if ($env:OS -ne 'Windows_NT') {
         throw 'This script must be run on Microsoft Windows 10 or Windows 11.'
+    }
+}
+
+function Assert-InputHookHelper {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "Native input-hook helper is missing: $Path"
+    }
+    $actualHash = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($actualHash -ne $Script:InputHookHelperSha256) {
+        throw ('Native input-hook helper failed its SHA-256 integrity check. Expected {0}; got {1}.' -f
+            $Script:InputHookHelperSha256, $actualHash)
     }
 }
 
@@ -87,16 +102,18 @@ function Write-GuardLog {
 }
 
 function Initialize-NativeMethods {
-    if ('XXPhoneInputGuardV3.NativeMethods' -as [type]) {
+    if ('XXPhoneInputGuardV4.NativeMethods' -as [type]) {
         return
     }
 
     $source = @'
 using System;
+using System.Diagnostics;
+using System.IO;
 using System.Runtime.InteropServices;
 using System.Threading;
 
-namespace XXPhoneInputGuardV3
+namespace XXPhoneInputGuardV4
 {
     public static class NativeMethods
     {
@@ -109,6 +126,42 @@ namespace XXPhoneInputGuardV3
             public byte SystemStatusFlag;
             public uint BatteryLifeTime;
             public uint BatteryFullLifeTime;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct JOBOBJECT_BASIC_LIMIT_INFORMATION
+        {
+            public long PerProcessUserTimeLimit;
+            public long PerJobUserTimeLimit;
+            public uint LimitFlags;
+            public UIntPtr MinimumWorkingSetSize;
+            public UIntPtr MaximumWorkingSetSize;
+            public uint ActiveProcessLimit;
+            public UIntPtr Affinity;
+            public uint PriorityClass;
+            public uint SchedulingClass;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct IO_COUNTERS
+        {
+            public ulong ReadOperationCount;
+            public ulong WriteOperationCount;
+            public ulong OtherOperationCount;
+            public ulong ReadTransferCount;
+            public ulong WriteTransferCount;
+            public ulong OtherTransferCount;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+        {
+            public JOBOBJECT_BASIC_LIMIT_INFORMATION BasicLimitInformation;
+            public IO_COUNTERS IoInfo;
+            public UIntPtr ProcessMemoryLimit;
+            public UIntPtr JobMemoryLimit;
+            public UIntPtr PeakProcessMemoryUsed;
+            public UIntPtr PeakJobMemoryUsed;
         }
 
         [StructLayout(LayoutKind.Sequential)]
@@ -175,6 +228,21 @@ namespace XXPhoneInputGuardV3
         [return: MarshalAs(UnmanagedType.Bool)]
         private static extern bool GetSystemPowerStatus(out SYSTEM_POWER_STATUS status);
 
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern IntPtr CreateJobObject(IntPtr securityAttributes, string name);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool SetInformationJobObject(
+            IntPtr job, int informationClass,
+            ref JOBOBJECT_EXTENDED_LIMIT_INFORMATION information,
+            uint informationLength);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool AssignProcessToJobObject(
+            IntPtr job, IntPtr process);
+
         private const uint ES_CONTINUOUS = 0x80000000;
         private const uint ES_SYSTEM_REQUIRED = 0x00000001;
         private const uint ES_DISPLAY_REQUIRED = 0x00000002;
@@ -182,6 +250,8 @@ namespace XXPhoneInputGuardV3
         private const int WH_MOUSE_LL = 14;
         private const uint WM_QUIT = 0x0012;
         private const uint PM_NOREMOVE = 0x0000;
+        private const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000;
+        private const int JobObjectExtendedLimitInformation = 9;
 
         private static readonly object HookSync = new object();
         private static readonly ManualResetEvent HookReady = new ManualResetEvent(false);
@@ -194,6 +264,11 @@ namespace XXPhoneInputGuardV3
         private static volatile bool suppressInput;
         private static int hookError;
         private static string hookStage = "not started";
+        private static readonly object BlockerSync = new object();
+        private static Process blockerProcess;
+        private static IntPtr blockerJob = IntPtr.Zero;
+        private static int blockerError;
+        private static string blockerStage = "not started";
 
         private static IntPtr KeyboardHook(int code, IntPtr wParam, IntPtr lParam)
         {
@@ -352,6 +427,158 @@ namespace XXPhoneInputGuardV3
             return hookStage;
         }
 
+        private static bool EnsureKillOnCloseJob()
+        {
+            if (blockerJob != IntPtr.Zero)
+                return true;
+
+            blockerStage = "creating the safety job";
+            blockerJob = CreateJobObject(IntPtr.Zero, null);
+            if (blockerJob == IntPtr.Zero)
+            {
+                blockerError = Marshal.GetLastWin32Error();
+                return false;
+            }
+
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION information =
+                new JOBOBJECT_EXTENDED_LIMIT_INFORMATION();
+            information.BasicLimitInformation.LimitFlags =
+                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if (!SetInformationJobObject(
+                    blockerJob,
+                    JobObjectExtendedLimitInformation,
+                    ref information,
+                    (uint)Marshal.SizeOf(typeof(JOBOBJECT_EXTENDED_LIMIT_INFORMATION))))
+            {
+                blockerError = Marshal.GetLastWin32Error();
+                return false;
+            }
+            return true;
+        }
+
+        public static bool StartInputBlocker(string executablePath)
+        {
+            lock (BlockerSync)
+            {
+                if (blockerProcess != null)
+                {
+                    try
+                    {
+                        blockerProcess.Refresh();
+                        if (!blockerProcess.HasExited)
+                            return true;
+                        blockerError = blockerProcess.ExitCode;
+                    }
+                    catch
+                    {
+                    }
+                    blockerProcess.Dispose();
+                    blockerProcess = null;
+                }
+
+                blockerError = 0;
+                blockerStage = "validating the native helper";
+                if (String.IsNullOrWhiteSpace(executablePath) ||
+                    !File.Exists(executablePath))
+                {
+                    blockerError = 2;
+                    return false;
+                }
+                if (!EnsureKillOnCloseJob())
+                    return false;
+
+                try
+                {
+                    blockerStage = "starting the native helper";
+                    ProcessStartInfo startInfo = new ProcessStartInfo();
+                    startInfo.FileName = executablePath;
+                    startInfo.WorkingDirectory = Path.GetDirectoryName(executablePath);
+                    startInfo.UseShellExecute = false;
+                    startInfo.CreateNoWindow = true;
+                    Process process = Process.Start(startInfo);
+                    if (process == null)
+                    {
+                        blockerError = 31;
+                        return false;
+                    }
+
+                    blockerStage = "placing the helper in the safety job";
+                    if (!AssignProcessToJobObject(blockerJob, process.Handle))
+                    {
+                        blockerError = Marshal.GetLastWin32Error();
+                        try { process.Kill(); } catch { }
+                        process.Dispose();
+                        return false;
+                    }
+
+                    blockerProcess = process;
+                    Thread.Sleep(175);
+                    blockerProcess.Refresh();
+                    if (blockerProcess.HasExited)
+                    {
+                        blockerError = blockerProcess.ExitCode;
+                        blockerStage = "the native helper exited during startup";
+                        blockerProcess.Dispose();
+                        blockerProcess = null;
+                        return false;
+                    }
+
+                    blockerStage = "active";
+                    return true;
+                }
+                catch (System.ComponentModel.Win32Exception error)
+                {
+                    blockerError = error.NativeErrorCode;
+                    return false;
+                }
+                catch
+                {
+                    blockerError = 31;
+                    return false;
+                }
+            }
+        }
+
+        public static bool StopInputBlocker()
+        {
+            lock (BlockerSync)
+            {
+                Process process = blockerProcess;
+                blockerProcess = null;
+                if (process == null)
+                    return true;
+
+                try
+                {
+                    process.Refresh();
+                    if (!process.HasExited)
+                    {
+                        process.Kill();
+                        process.WaitForExit(2000);
+                    }
+                    process.Dispose();
+                    blockerStage = "stopped";
+                    return true;
+                }
+                catch (System.ComponentModel.Win32Exception error)
+                {
+                    blockerError = error.NativeErrorCode;
+                    blockerStage = "stopping the native helper";
+                    return false;
+                }
+            }
+        }
+
+        public static int GetBlockerError()
+        {
+            return blockerError;
+        }
+
+        public static string GetBlockerStage()
+        {
+            return blockerStage;
+        }
+
         public static bool SetKeepAwake(bool enabled)
         {
             uint flags = ES_CONTINUOUS;
@@ -384,7 +611,7 @@ namespace XXPhoneInputGuardV3
     }
 
     $buildDirectory = Join-Path ([IO.Path]::GetTempPath()) (
-        'XXPhoneInputGuardNativeV3-' + [Guid]::NewGuid().ToString('N'))
+        'XXPhoneInputGuardNativeV4-' + [Guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $buildDirectory -Force | Out-Null
     $sourcePath = Join-Path $buildDirectory 'NativeMethods.cs'
     $assemblyPath = Join-Path $buildDirectory 'NativeMethods.dll'
@@ -813,7 +1040,7 @@ function Reset-PowerRescueState {
         [Parameter(Mandatory = $true)][long]$NowMilliseconds
     )
 
-    $ac = [XXPhoneInputGuardV3.NativeMethods]::GetACLineStatus()
+    $ac = [XXPhoneInputGuardV4.NativeMethods]::GetACLineStatus()
     $State.StableAC = $ac
     $State.CandidateAC = $ac
     $State.CandidateSince = $NowMilliseconds
@@ -828,7 +1055,7 @@ function Update-PowerRescueState {
         [Parameter(Mandatory = $true)][long]$NowMilliseconds
     )
 
-    $rawAC = [XXPhoneInputGuardV3.NativeMethods]::GetACLineStatus()
+    $rawAC = [XXPhoneInputGuardV4.NativeMethods]::GetACLineStatus()
     if ($rawAC -lt 0) {
         return $false
     }
@@ -1027,6 +1254,7 @@ function Invoke-GuardLoop {
     Assert-Windows
     Initialize-NativeMethods
     Initialize-BleWatcherBridge
+    Assert-InputHookHelper -Path $Script:InputHookHelper
 
     if (-not (Test-Path -LiteralPath $Script:ArmedPath)) {
         return
@@ -1045,7 +1273,7 @@ function Invoke-GuardLoop {
     $banner = New-GuardBanner -Text ([string]$config.banner_text)
     $clock = [Diagnostics.Stopwatch]::StartNew()
     $presence = New-PresenceState
-    $initialAC = [XXPhoneInputGuardV3.NativeMethods]::GetACLineStatus()
+    $initialAC = [XXPhoneInputGuardV4.NativeMethods]::GetACLineStatus()
     $powerState = @{
         StableAC       = $initialAC
         CandidateAC    = $initialAC
@@ -1106,14 +1334,15 @@ function Invoke-GuardLoop {
             $shouldBlock = $baseRisk -and (-not $rescueActive)
             if ($shouldBlock) {
                 if ((-not $inputBlocked) -or (($now - $lastBlockAssert) -ge 1000)) {
-                    $blockedNow = [XXPhoneInputGuardV3.NativeMethods]::BlockInput($true)
+                    $blockedNow = [XXPhoneInputGuardV4.NativeMethods]::StartInputBlocker(
+                        $Script:InputHookHelper)
                     if ($blockedNow) {
                         $inputBlocked = $true
                     }
                     elseif (-not $inputBlocked) {
-                        Write-GuardLog ('Input hooks failed while {0}; Win32 error {1}.' -f
-                            [XXPhoneInputGuardV3.NativeMethods]::GetHookStage(),
-                            [XXPhoneInputGuardV3.NativeMethods]::GetLastError())
+                        Write-GuardLog ('Native input helper failed while {0}; error {1}.' -f
+                            [XXPhoneInputGuardV4.NativeMethods]::GetBlockerStage(),
+                            [XXPhoneInputGuardV4.NativeMethods]::GetBlockerError())
                     }
                     $lastBlockAssert = $now
                 }
@@ -1122,17 +1351,17 @@ function Invoke-GuardLoop {
                     $banner.BringToFront()
                     $banner.Refresh()
                 }
-                [void][XXPhoneInputGuardV3.NativeMethods]::SetKeepAwake($true)
+                [void][XXPhoneInputGuardV4.NativeMethods]::SetKeepAwake($true)
             }
             else {
                 if ($banner.Visible) {
                     $banner.Hide()
                 }
                 if ($inputBlocked) {
-                    [void][XXPhoneInputGuardV3.NativeMethods]::BlockInput($false)
+                    [void][XXPhoneInputGuardV4.NativeMethods]::StopInputBlocker()
                     $inputBlocked = $false
                 }
-                [void][XXPhoneInputGuardV3.NativeMethods]::SetKeepAwake($false)
+                [void][XXPhoneInputGuardV4.NativeMethods]::SetKeepAwake($false)
             }
 
             if (($null -eq $lastRisk) -or ([bool]$baseRisk -ne [bool]$lastRisk)) {
@@ -1170,8 +1399,8 @@ function Invoke-GuardLoop {
         throw
     }
     finally {
-        [void][XXPhoneInputGuardV3.NativeMethods]::BlockInput($false)
-        [void][XXPhoneInputGuardV3.NativeMethods]::SetKeepAwake($false)
+        [void][XXPhoneInputGuardV4.NativeMethods]::StopInputBlocker()
+        [void][XXPhoneInputGuardV4.NativeMethods]::SetKeepAwake($false)
         if ($null -ne $banner) {
             $banner.Close()
             $banner.Dispose()
@@ -1203,10 +1432,21 @@ function Install-Guard {
     New-Item -ItemType Directory -Path $Script:InstallRoot -Force | Out-Null
     $sourcePath = [IO.Path]::GetFullPath($PSCommandPath)
     $destinationPath = [IO.Path]::GetFullPath($Script:InstalledScript)
+    $sourceHelperPath = Join-Path (Split-Path -Parent $sourcePath) 'windows-input-hook-helper.exe'
+    Assert-InputHookHelper -Path $sourceHelperPath
     if (-not [string]::Equals($sourcePath, $destinationPath, [StringComparison]::OrdinalIgnoreCase)) {
         Copy-Item -LiteralPath $sourcePath -Destination $destinationPath -Force
     }
+    $helperDestinationPath = [IO.Path]::GetFullPath($Script:InputHookHelper)
+    if (-not [string]::Equals(
+            ([IO.Path]::GetFullPath($sourceHelperPath)),
+            $helperDestinationPath,
+            [StringComparison]::OrdinalIgnoreCase)) {
+        Copy-Item -LiteralPath $sourceHelperPath -Destination $helperDestinationPath -Force
+    }
     Unblock-File -LiteralPath $destinationPath -ErrorAction SilentlyContinue
+    Unblock-File -LiteralPath $helperDestinationPath -ErrorAction SilentlyContinue
+    Assert-InputHookHelper -Path $helperDestinationPath
     $config | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $Script:ConfigPath -Encoding UTF8
 
     $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
@@ -1221,6 +1461,7 @@ function Install-Guard {
 
     Write-Host 'Installed for the current user without administrator access.' -ForegroundColor Green
     Write-Host ('Installed script: ' + $Script:InstalledScript)
+    Write-Host ('Native input helper: ' + $Script:InputHookHelper)
     Write-Host 'The startup entry is installed, but the guard is deliberately DISARMED.' -ForegroundColor Yellow
     Write-Host 'Run Observe, then SelfTest, and finally Arm.'
 }
@@ -1228,20 +1469,22 @@ function Install-Guard {
 function Invoke-SelfTest {
     Assert-Windows
     Initialize-NativeMethods
+    Assert-InputHookHelper -Path $Script:InputHookHelper
     $blocked = $false
     try {
-        $blocked = [XXPhoneInputGuardV3.NativeMethods]::BlockInput($true)
+        $blocked = [XXPhoneInputGuardV4.NativeMethods]::StartInputBlocker(
+            $Script:InputHookHelper)
         if (-not $blocked) {
-            throw ('Input hooks could not be installed while {0}; Win32 error {1}.' -f
-                [XXPhoneInputGuardV3.NativeMethods]::GetHookStage(),
-                [XXPhoneInputGuardV3.NativeMethods]::GetLastError())
+            throw ('Native input helper failed while {0}; error {1}.' -f
+                [XXPhoneInputGuardV4.NativeMethods]::GetBlockerStage(),
+                [XXPhoneInputGuardV4.NativeMethods]::GetBlockerError())
         }
         Start-Sleep -Milliseconds 250
     }
     finally {
-        [void][XXPhoneInputGuardV3.NativeMethods]::BlockInput($false)
+        [void][XXPhoneInputGuardV4.NativeMethods]::StopInputBlocker()
     }
-    Write-Host 'Non-admin input-hook self-test passed; input was released.' -ForegroundColor Green
+    Write-Host 'Native non-admin input-hook self-test passed; input was released.' -ForegroundColor Green
 }
 
 function Arm-Guard {
