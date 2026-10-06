@@ -49,7 +49,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$Script:GuardVersion = '2.1.1'
+$Script:GuardVersion = '2.1.2'
 $Script:NativeMethodsType = $null
 $Script:InstallRoot = Join-Path $env:LOCALAPPDATA 'KIDZ'
 $Script:InstalledScript = Join-Path $Script:InstallRoot 'phone-input-guard-windows-ble.ps1'
@@ -106,10 +106,17 @@ function Initialize-NativeMethods {
     if ($null -ne $Script:NativeMethodsType) {
         return
     }
-    $existingType = 'XXPhoneInputGuardV4.NativeMethods' -as [type]
-    if ($null -ne $existingType) {
-        $Script:NativeMethodsType = $existingType
-        return
+    foreach ($loadedAssembly in [AppDomain]::CurrentDomain.GetAssemblies()) {
+        try {
+            $existingType = $loadedAssembly.GetType(
+                'XXPhoneInputGuardV5.NativeMethods', $false, $false)
+            if ($null -ne $existingType) {
+                $Script:NativeMethodsType = $existingType
+                return
+            }
+        }
+        catch {
+        }
     }
 
     $source = @'
@@ -119,7 +126,7 @@ using System.IO;
 using System.Runtime.InteropServices;
 using System.Threading;
 
-namespace XXPhoneInputGuardV4
+namespace XXPhoneInputGuardV5
 {
     public static class NativeMethods
     {
@@ -617,10 +624,10 @@ namespace XXPhoneInputGuardV4
     }
 
     $buildDirectory = Join-Path ([IO.Path]::GetTempPath()) (
-        'XXPhoneInputGuardNativeV4-' + [Guid]::NewGuid().ToString('N'))
+        'XXPhoneInputGuardNativeV5-' + [Guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $buildDirectory -Force | Out-Null
-    $sourcePath = Join-Path $buildDirectory 'NativeMethods.cs'
-    $assemblyPath = Join-Path $buildDirectory 'NativeMethods.dll'
+    $sourcePath = Join-Path $buildDirectory 'XXPhoneInputGuardNativeV5.cs'
+    $assemblyPath = Join-Path $buildDirectory 'XXPhoneInputGuardNativeV5.dll'
     Set-Content -LiteralPath $sourcePath -Value $source -Encoding UTF8
 
     $compilerOutput = @(& $compiler /nologo /target:library /optimize+ `
@@ -631,10 +638,9 @@ namespace XXPhoneInputGuardV4
             ($compilerOutput -join [Environment]::NewLine))
     }
 
-    $loadedTypes = @(Add-Type -LiteralPath $assemblyPath -PassThru)
-    $Script:NativeMethodsType = $loadedTypes |
-        Where-Object { $_.FullName -eq 'XXPhoneInputGuardV4.NativeMethods' } |
-        Select-Object -First 1
+    $loadedAssembly = [Reflection.Assembly]::LoadFrom($assemblyPath)
+    $Script:NativeMethodsType = $loadedAssembly.GetType(
+        'XXPhoneInputGuardV5.NativeMethods', $false, $false)
     if ($null -eq $Script:NativeMethodsType) {
         throw 'The compiled native-method bridge loaded without its expected public type.'
     }
