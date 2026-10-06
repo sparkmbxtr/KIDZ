@@ -49,8 +49,9 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$Script:GuardVersion = '2.1.2'
+$Script:GuardVersion = '2.1.3'
 $Script:NativeMethodsType = $null
+$Script:BleWatcherBridgeType = $null
 $Script:InstallRoot = Join-Path $env:LOCALAPPDATA 'KIDZ'
 $Script:InstalledScript = Join-Path $Script:InstallRoot 'phone-input-guard-windows-ble.ps1'
 $Script:InputHookHelper = Join-Path $Script:InstallRoot 'windows-input-hook-helper.exe'
@@ -59,6 +60,7 @@ $Script:ConfigPath = Join-Path $Script:InstallRoot 'windows-ble-config.json'
 $Script:LogPath = Join-Path $Script:InstallRoot 'windows-ble-guard.log'
 $Script:StatePath = Join-Path $Script:InstallRoot 'windows-ble-state.json'
 $Script:PidPath = Join-Path $Script:InstallRoot 'windows-ble-guard.pid'
+$Script:ReadyPath = Join-Path $Script:InstallRoot 'windows-ble-ready.json'
 $Script:ArmedPath = Join-Path $Script:InstallRoot 'windows-ble-armed.flag'
 $Script:StopPath = Join-Path $Script:InstallRoot 'windows-ble-stop.flag'
 $Script:RunKeyPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
@@ -106,18 +108,6 @@ function Initialize-NativeMethods {
     if ($null -ne $Script:NativeMethodsType) {
         return
     }
-    foreach ($loadedAssembly in [AppDomain]::CurrentDomain.GetAssemblies()) {
-        try {
-            $existingType = $loadedAssembly.GetType(
-                'XXPhoneInputGuardV5.NativeMethods', $false, $false)
-            if ($null -ne $existingType) {
-                $Script:NativeMethodsType = $existingType
-                return
-            }
-        }
-        catch {
-        }
-    }
 
     $source = @'
 using System;
@@ -126,7 +116,7 @@ using System.IO;
 using System.Runtime.InteropServices;
 using System.Threading;
 
-namespace XXPhoneInputGuardV5
+namespace XXPhoneInputGuardV6
 {
     public static class NativeMethods
     {
@@ -255,6 +245,10 @@ namespace XXPhoneInputGuardV5
         [return: MarshalAs(UnmanagedType.Bool)]
         private static extern bool AssignProcessToJobObject(
             IntPtr job, IntPtr process);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool CloseHandle(IntPtr handle);
 
         private const uint ES_CONTINUOUS = 0x80000000;
         private const uint ES_SYSTEM_REQUIRED = 0x00000001;
@@ -457,15 +451,59 @@ namespace XXPhoneInputGuardV5
                 new JOBOBJECT_EXTENDED_LIMIT_INFORMATION();
             information.BasicLimitInformation.LimitFlags =
                 JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            blockerStage = "configuring the safety job";
             if (!SetInformationJobObject(
                     blockerJob,
                     JobObjectExtendedLimitInformation,
                     ref information,
                     (uint)Marshal.SizeOf(typeof(JOBOBJECT_EXTENDED_LIMIT_INFORMATION))))
             {
-                blockerError = Marshal.GetLastWin32Error();
+                int informationError = Marshal.GetLastWin32Error();
+                IntPtr unusableJob = blockerJob;
+                blockerJob = IntPtr.Zero;
+                if (unusableJob != IntPtr.Zero)
+                    CloseHandle(unusableJob);
+                blockerError = informationError;
                 return false;
             }
+            return true;
+        }
+
+        private static bool IsBlockerExitConfirmed(Process process, int waitMilliseconds)
+        {
+            try
+            {
+                process.Refresh();
+                if (process.HasExited)
+                    return true;
+                if (waitMilliseconds <= 0)
+                    return false;
+                if (!process.WaitForExit(waitMilliseconds))
+                    return false;
+                process.Refresh();
+                return process.HasExited;
+            }
+            catch (System.ComponentModel.Win32Exception error)
+            {
+                blockerError = error.NativeErrorCode;
+                return false;
+            }
+            catch (InvalidOperationException)
+            {
+                blockerError = 6;
+                return false;
+            }
+        }
+
+        private static bool CompleteBlockerStop(Process process)
+        {
+            if (!IsBlockerExitConfirmed(process, 0))
+                return false;
+
+            blockerProcess = null;
+            process.Dispose();
+            blockerError = 0;
+            blockerStage = "stopped";
             return true;
         }
 
@@ -479,11 +517,20 @@ namespace XXPhoneInputGuardV5
                     {
                         blockerProcess.Refresh();
                         if (!blockerProcess.HasExited)
-                            return true;
+                            return blockerStage == "active";
                         blockerError = blockerProcess.ExitCode;
                     }
-                    catch
+                    catch (System.ComponentModel.Win32Exception error)
                     {
+                        blockerError = error.NativeErrorCode;
+                        blockerStage = "checking the existing native helper";
+                        return false;
+                    }
+                    catch (InvalidOperationException)
+                    {
+                        blockerError = 6;
+                        blockerStage = "checking the existing native helper";
+                        return false;
                     }
                     blockerProcess.Dispose();
                     blockerProcess = null;
@@ -514,17 +561,25 @@ namespace XXPhoneInputGuardV5
                         blockerError = 31;
                         return false;
                     }
+                    // Track the process immediately.  Any later failure must
+                    // leave enough state for StopInputBlocker to confirm exit.
+                    blockerProcess = process;
 
                     blockerStage = "placing the helper in the safety job";
                     if (!AssignProcessToJobObject(blockerJob, process.Handle))
                     {
-                        blockerError = Marshal.GetLastWin32Error();
+                        int assignmentError = Marshal.GetLastWin32Error();
                         try { process.Kill(); } catch { }
-                        process.Dispose();
+                        if (IsBlockerExitConfirmed(process, 2000))
+                        {
+                            blockerProcess = null;
+                            process.Dispose();
+                        }
+                        blockerError = assignmentError;
+                        blockerStage = "placing the helper in the safety job";
                         return false;
                     }
 
-                    blockerProcess = process;
                     Thread.Sleep(175);
                     blockerProcess.Refresh();
                     if (blockerProcess.HasExited)
@@ -557,28 +612,64 @@ namespace XXPhoneInputGuardV5
             lock (BlockerSync)
             {
                 Process process = blockerProcess;
-                blockerProcess = null;
                 if (process == null)
-                    return true;
-
-                try
                 {
-                    process.Refresh();
-                    if (!process.HasExited)
-                    {
-                        process.Kill();
-                        process.WaitForExit(2000);
-                    }
-                    process.Dispose();
+                    blockerError = 0;
                     blockerStage = "stopped";
                     return true;
                 }
-                catch (System.ComponentModel.Win32Exception error)
+
+                blockerError = 0;
+                blockerStage = "stopping the native helper";
+                if (CompleteBlockerStop(process))
+                    return true;
+
+                // Retry direct termination.  Keep blockerProcess assigned until
+                // Windows confirms that the process really has exited.
+                for (int attempt = 0; attempt < 3; attempt++)
                 {
-                    blockerError = error.NativeErrorCode;
-                    blockerStage = "stopping the native helper";
-                    return false;
+                    try
+                    {
+                        process.Kill();
+                    }
+                    catch (System.ComponentModel.Win32Exception error)
+                    {
+                        blockerError = error.NativeErrorCode;
+                    }
+                    catch (InvalidOperationException)
+                    {
+                        blockerError = 6;
+                    }
+
+                    if (IsBlockerExitConfirmed(process, 500) &&
+                        CompleteBlockerStop(process))
+                        return true;
                 }
+
+                // Closing a KILL_ON_JOB_CLOSE job is an independent fallback
+                // when direct Process.Kill did not produce a confirmed exit.
+                blockerStage = "closing the safety job to stop the native helper";
+                IntPtr job = blockerJob;
+                if (job != IntPtr.Zero)
+                {
+                    if (CloseHandle(job))
+                    {
+                        blockerJob = IntPtr.Zero;
+                    }
+                    else
+                    {
+                        blockerError = Marshal.GetLastWin32Error();
+                    }
+                }
+
+                if (IsBlockerExitConfirmed(process, 2000) &&
+                    CompleteBlockerStop(process))
+                    return true;
+
+                if (blockerError == 0)
+                    blockerError = 1460;
+                blockerStage = "waiting for the native helper to exit";
+                return false;
             }
         }
 
@@ -612,6 +703,42 @@ namespace XXPhoneInputGuardV5
 }
 '@
 
+    # A source-derived simple name prevents the CLR from unifying this bridge
+    # with a different implementation already loaded in the same PowerShell
+    # process.  Identical source reuses its exact loaded assembly and type.
+    $sourceBytes = [Text.Encoding]::UTF8.GetBytes($source)
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    try {
+        $sourceHash = [BitConverter]::ToString(
+            $sha256.ComputeHash($sourceBytes)).Replace('-', '').ToLowerInvariant()
+    }
+    finally {
+        $sha256.Dispose()
+    }
+    $assemblySimpleName = 'XXPhoneInputGuardNative_' + $sourceHash
+    $nativeTypeName = 'XXPhoneInputGuardV6.NativeMethods'
+
+    foreach ($loadedAssembly in [AppDomain]::CurrentDomain.GetAssemblies()) {
+        try {
+            if ($loadedAssembly.GetName().Name -ne $assemblySimpleName) {
+                continue
+            }
+            $existingType = $loadedAssembly.GetType(
+                $nativeTypeName, $false, $false)
+            if ($null -eq $existingType) {
+                throw ('Loaded native bridge assembly {0} lacks {1}.' -f
+                    $assemblySimpleName, $nativeTypeName)
+            }
+            $Script:NativeMethodsType = $existingType
+            return
+        }
+        catch {
+            if ($_.Exception.Message -like 'Loaded native bridge assembly*') {
+                throw
+            }
+        }
+    }
+
     $compilerCandidates = @(
         (Join-Path $env:windir 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'),
         (Join-Path $env:windir 'Microsoft.NET\Framework\v4.0.30319\csc.exe')
@@ -624,10 +751,10 @@ namespace XXPhoneInputGuardV5
     }
 
     $buildDirectory = Join-Path ([IO.Path]::GetTempPath()) (
-        'XXPhoneInputGuardNativeV5-' + [Guid]::NewGuid().ToString('N'))
+        'XXNativeBuild-' + [Guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $buildDirectory -Force | Out-Null
-    $sourcePath = Join-Path $buildDirectory 'XXPhoneInputGuardNativeV5.cs'
-    $assemblyPath = Join-Path $buildDirectory 'XXPhoneInputGuardNativeV5.dll'
+    $sourcePath = Join-Path $buildDirectory 'NativeMethods.cs'
+    $assemblyPath = Join-Path $buildDirectory ($assemblySimpleName + '.dll')
     Set-Content -LiteralPath $sourcePath -Value $source -Encoding UTF8
 
     $compilerOutput = @(& $compiler /nologo /target:library /optimize+ `
@@ -639,15 +766,21 @@ namespace XXPhoneInputGuardV5
     }
 
     $loadedAssembly = [Reflection.Assembly]::LoadFrom($assemblyPath)
+    if ($loadedAssembly.GetName().Name -ne $assemblySimpleName) {
+        throw ('The compiled native bridge has an unexpected assembly identity: {0}.' -f
+            $loadedAssembly.GetName().Name)
+    }
     $Script:NativeMethodsType = $loadedAssembly.GetType(
-        'XXPhoneInputGuardV5.NativeMethods', $false, $false)
+        $nativeTypeName, $false, $false)
     if ($null -eq $Script:NativeMethodsType) {
         throw 'The compiled native-method bridge loaded without its expected public type.'
     }
 }
 
 function Initialize-BleWatcherBridge {
-    if ('XXPhoneInputGuardBleV2.BleWatcherBridge' -as [type]) {
+    $cachedType = Get-Variable -Name BleWatcherBridgeType -Scope Script `
+        -ErrorAction SilentlyContinue
+    if (($null -ne $cachedType) -and ($null -ne $cachedType.Value)) {
         return
     }
 
@@ -794,6 +927,44 @@ namespace XXPhoneInputGuardBleV2
 }
 '@
 
+    # The CLR identifies an unsigned assembly primarily by its simple name and
+    # version.  Loading a newly compiled DLL under a reused name can therefore
+    # return an older assembly that is already resident in Windows PowerShell.
+    # Derive the simple name from the complete source text so changed source
+    # always has a new process-wide identity, while identical source is reused.
+    $sourceBytes = [Text.Encoding]::UTF8.GetBytes($source)
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    try {
+        $sourceHash = [BitConverter]::ToString(
+            $sha256.ComputeHash($sourceBytes)).Replace('-', '').ToLowerInvariant()
+    }
+    finally {
+        $sha256.Dispose()
+    }
+    $assemblySimpleName = 'XXPhoneInputGuardBle_' + $sourceHash
+    $bridgeTypeName = 'XXPhoneInputGuardBleV2.BleWatcherBridge'
+
+    foreach ($loadedAssembly in [AppDomain]::CurrentDomain.GetAssemblies()) {
+        try {
+            if ($loadedAssembly.GetName().Name -ne $assemblySimpleName) {
+                continue
+            }
+            $existingType = $loadedAssembly.GetType(
+                $bridgeTypeName, $false, $false)
+            if ($null -eq $existingType) {
+                throw ('Loaded BLE bridge assembly {0} lacks {1}.' -f
+                    $assemblySimpleName, $bridgeTypeName)
+            }
+            $Script:BleWatcherBridgeType = $existingType
+            return
+        }
+        catch {
+            if ($_.Exception.Message -like 'Loaded BLE bridge assembly*') {
+                throw
+            }
+        }
+    }
+
     $compilerCandidates = @(
         (Join-Path $env:windir 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'),
         (Join-Path $env:windir 'Microsoft.NET\Framework\v4.0.30319\csc.exe')
@@ -806,10 +977,10 @@ namespace XXPhoneInputGuardBleV2
     }
 
     $buildDirectory = Join-Path ([IO.Path]::GetTempPath()) (
-        'XXPhoneInputGuardBleV2-' + [Guid]::NewGuid().ToString('N'))
+        'XXBleBuild-' + [Guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $buildDirectory -Force | Out-Null
     $sourcePath = Join-Path $buildDirectory 'BleWatcherBridge.cs'
-    $assemblyPath = Join-Path $buildDirectory 'BleWatcherBridge.dll'
+    $assemblyPath = Join-Path $buildDirectory ($assemblySimpleName + '.dll')
     Set-Content -LiteralPath $sourcePath -Value $source -Encoding UTF8
 
     $compilerArguments = @(
@@ -830,7 +1001,24 @@ namespace XXPhoneInputGuardBleV2
             ($compilerOutput -join [Environment]::NewLine))
     }
 
-    Add-Type -LiteralPath $assemblyPath
+    $loadedAssembly = [Reflection.Assembly]::LoadFrom($assemblyPath)
+    if ($loadedAssembly.GetName().Name -ne $assemblySimpleName) {
+        throw ('The compiled BLE bridge has an unexpected assembly identity: {0}.' -f
+            $loadedAssembly.GetName().Name)
+    }
+    $Script:BleWatcherBridgeType = $loadedAssembly.GetType(
+        $bridgeTypeName, $false, $false)
+    if ($null -eq $Script:BleWatcherBridgeType) {
+        throw 'The compiled BLE bridge loaded without its expected public type.'
+    }
+}
+
+function New-BleWatcherBridge {
+    param([Parameter(Mandatory = $true)][Guid]$TargetUuid)
+
+    Initialize-BleWatcherBridge
+    return [Activator]::CreateInstance(
+        $Script:BleWatcherBridgeType, [object[]]@($TargetUuid))
 }
 
 function ConvertTo-TargetGuid {
@@ -1170,9 +1358,33 @@ function Test-GuardProcess {
     }
 }
 
+function Test-GuardReady {
+    if (-not (Test-Path -LiteralPath $Script:ReadyPath) -or
+        -not (Test-Path -LiteralPath $Script:PidPath)) {
+        return $false
+    }
+    try {
+        $guardPid = [int](Get-Content -LiteralPath $Script:PidPath -Raw)
+        $readyState = Get-Content -LiteralPath $Script:ReadyPath -Raw | ConvertFrom-Json
+        if ([int]$readyState.pid -ne $guardPid) {
+            return $false
+        }
+        if (-not [string]::Equals(
+                [string]$readyState.version,
+                $Script:GuardVersion,
+                [StringComparison]::Ordinal)) {
+            return $false
+        }
+        return ($null -ne (Get-Process -Id $guardPid -ErrorAction Stop))
+    }
+    catch {
+        return $false
+    }
+}
+
 function Start-GuardProcess {
     if (Test-GuardProcess) {
-        return
+        return $null
     }
     if (-not (Test-Path -LiteralPath $Script:InstalledScript)) {
         throw 'Installed guard script is missing. Run Install again.'
@@ -1180,7 +1392,8 @@ function Start-GuardProcess {
     $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     $arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -Sta -File "{0}" Run' -f
         $Script:InstalledScript
-    Start-Process -FilePath $windowsPowerShell -ArgumentList $arguments -WindowStyle Hidden | Out-Null
+    return (Start-Process -FilePath $windowsPowerShell -ArgumentList $arguments `
+        -WindowStyle Hidden -PassThru)
 }
 
 function Test-BleNearNow {
@@ -1191,7 +1404,7 @@ function Test-BleNearNow {
 
     Initialize-BleWatcherBridge
     $guid = ConvertTo-TargetGuid -Value ([string]$Config.service_uuid)
-    $bridge = [XXPhoneInputGuardBleV2.BleWatcherBridge]::new($guid)
+    $bridge = New-BleWatcherBridge -TargetUuid $guid
     $bestRssi = -127
     try {
         $bridge.Start()
@@ -1225,7 +1438,7 @@ function Invoke-Observe {
         New-GuardConfig
     }
     $guid = ConvertTo-TargetGuid -Value ([string]$config.service_uuid)
-    $bridge = [XXPhoneInputGuardBleV2.BleWatcherBridge]::new($guid)
+    $bridge = New-BleWatcherBridge -TargetUuid $guid
     $clock = [Diagnostics.Stopwatch]::StartNew()
     $presence = New-PresenceState
     $nextLine = [long]0
@@ -1288,9 +1501,13 @@ function Invoke-GuardLoop {
         return
     }
 
+    # A ready file belongs only to the process that currently owns the mutex.
+    Remove-Item -LiteralPath $Script:ReadyPath -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath ($Script:ReadyPath + '.tmp') -Force -ErrorAction SilentlyContinue
+
     $config = Get-GuardConfig
     $guid = ConvertTo-TargetGuid -Value ([string]$config.service_uuid)
-    $bridge = [XXPhoneInputGuardBleV2.BleWatcherBridge]::new($guid)
+    $bridge = New-BleWatcherBridge -TargetUuid $guid
     $banner = New-GuardBanner -Text ([string]$config.banner_text)
     $clock = [Diagnostics.Stopwatch]::StartNew()
     $presence = New-PresenceState
@@ -1307,9 +1524,11 @@ function Invoke-GuardLoop {
     $nextWifiPoll = [long]0
     $nextStateWrite = [long]0
     $lastBlockAssert = [long]-10000
+    $lastBlockFailureLog = [long]-10000
+    $lastReleaseFailureLog = [long]-10000
     $inputBlocked = $false
     $rescueActive = $false
-    $lastRisk = $null
+    $lastEffectiveBlock = $null
     $PID | Set-Content -LiteralPath $Script:PidPath -Encoding ASCII
     Remove-Item -LiteralPath $Script:StopPath -Force -ErrorAction SilentlyContinue
 
@@ -1319,6 +1538,16 @@ function Invoke-GuardLoop {
 
     try {
         $bridge.Start()
+        $readyState = [pscustomobject][ordered]@{
+            pid       = $PID
+            ready_utc = [DateTime]::UtcNow.ToString('o')
+            version   = $Script:GuardVersion
+        }
+        $temporaryReadyPath = $Script:ReadyPath + '.tmp'
+        $readyState | ConvertTo-Json -Depth 2 |
+            Set-Content -LiteralPath $temporaryReadyPath -Encoding UTF8
+        Move-Item -LiteralPath $temporaryReadyPath `
+            -Destination $Script:ReadyPath -Force
         while ((Test-Path -LiteralPath $Script:ArmedPath) -and
             -not (Test-Path -LiteralPath $Script:StopPath)) {
             $now = [long]$clock.ElapsedMilliseconds
@@ -1360,10 +1589,19 @@ function Invoke-GuardLoop {
                     if ($blockedNow) {
                         $inputBlocked = $true
                     }
-                    elseif (-not $inputBlocked) {
-                        Write-GuardLog ('Native input helper failed while {0}; error {1}.' -f
-                            $nativeMethods::GetBlockerStage(),
-                            $nativeMethods::GetBlockerError())
+                    else {
+                        if (($now - $lastBlockFailureLog) -ge 5000) {
+                            Write-GuardLog ('Native input helper failed while {0}; error {1}.' -f
+                                $nativeMethods::GetBlockerStage(),
+                                $nativeMethods::GetBlockerError())
+                            $lastBlockFailureLog = $now
+                        }
+                        # A failed start can occur after the helper process was created.
+                        # Stop it immediately so an unconfirmed helper never runs silently.
+                        $failedStartReleased = [bool]$nativeMethods::StopInputBlocker()
+                        # Conservatively treat an unconfirmed helper as blocking.
+                        # This keeps the banner visible and retries release.
+                        $inputBlocked = -not $failedStartReleased
                     }
                     $lastBlockAssert = $now
                 }
@@ -1372,21 +1610,45 @@ function Invoke-GuardLoop {
                     $banner.BringToFront()
                     $banner.Refresh()
                 }
+                elseif ((-not $inputBlocked) -and $banner.Visible) {
+                    $banner.Hide()
+                }
                 $null = $nativeMethods::SetKeepAwake($true)
             }
             else {
-                if ($banner.Visible) {
-                    $banner.Hide()
-                }
                 if ($inputBlocked) {
-                    $null = $nativeMethods::StopInputBlocker()
-                    $inputBlocked = $false
+                    $releaseConfirmed = [bool]$nativeMethods::StopInputBlocker()
+                    if ($releaseConfirmed) {
+                        $inputBlocked = $false
+                    }
+                    elseif (($now - $lastReleaseFailureLog) -ge 5000) {
+                        Write-GuardLog ('Input release remains pending while {0}; error {1}.' -f
+                            $nativeMethods::GetBlockerStage(),
+                            $nativeMethods::GetBlockerError())
+                        $lastReleaseFailureLog = $now
+                    }
                 }
-                $null = $nativeMethods::SetKeepAwake($false)
+
+                if ($inputBlocked) {
+                    if (-not $banner.Visible) {
+                        $banner.Show()
+                        $banner.BringToFront()
+                        $banner.Refresh()
+                    }
+                    $null = $nativeMethods::SetKeepAwake($true)
+                }
+                else {
+                    if ($banner.Visible) {
+                        $banner.Hide()
+                    }
+                    $null = $nativeMethods::SetKeepAwake($false)
+                }
             }
 
-            if (($null -eq $lastRisk) -or ([bool]$baseRisk -ne [bool]$lastRisk)) {
-                if ($baseRisk) {
+            $effectiveBlock = [bool]$shouldBlock -or [bool]$inputBlocked
+            if (($null -eq $lastEffectiveBlock) -or
+                ([bool]$effectiveBlock -ne [bool]$lastEffectiveBlock)) {
+                if ($effectiveBlock) {
                     Write-GuardLog ('Phone classified FAR: {0}; input block requested.' -f $presence.Reason)
                 }
                 else {
@@ -1401,7 +1663,7 @@ function Invoke-GuardLoop {
                     }
                     Write-GuardLog ('Input released: ' + $releaseReason + '.')
                 }
-                $lastRisk = $baseRisk
+                $lastEffectiveBlock = $effectiveBlock
             }
 
             if ($now -ge $nextStateWrite) {
@@ -1420,7 +1682,7 @@ function Invoke-GuardLoop {
         throw
     }
     finally {
-        $null = $nativeMethods::StopInputBlocker()
+        $releaseConfirmed = [bool]$nativeMethods::StopInputBlocker()
         $null = $nativeMethods::SetKeepAwake($false)
         if ($null -ne $banner) {
             $banner.Close()
@@ -1438,9 +1700,19 @@ function Invoke-GuardLoop {
         catch {
         }
         Remove-Item -LiteralPath $Script:StopPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $Script:ReadyPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath ($Script:ReadyPath + '.tmp') -Force -ErrorAction SilentlyContinue
         $mutex.ReleaseMutex()
         $mutex.Dispose()
-        Write-GuardLog 'Guard stopped; input released.'
+        if ($releaseConfirmed) {
+            Write-GuardLog 'Guard stopped; input release confirmed.'
+        }
+        else {
+            Write-GuardLog (('Guard stopped; helper release was not confirmed while {0}; error {1}. ' +
+                'Process exit will close the safety job.') -f
+                $nativeMethods::GetBlockerStage(),
+                $nativeMethods::GetBlockerError())
+        }
     }
 }
 
@@ -1479,6 +1751,8 @@ function Install-Guard {
 
     Remove-Item -LiteralPath $Script:ArmedPath -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $Script:StopPath -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $Script:ReadyPath -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath ($Script:ReadyPath + '.tmp') -Force -ErrorAction SilentlyContinue
 
     Write-Host 'Installed for the current user without administrator access.' -ForegroundColor Green
     Write-Host ('Installed script: ' + $Script:InstalledScript)
@@ -1493,6 +1767,7 @@ function Invoke-SelfTest {
     Assert-InputHookHelper -Path $Script:InputHookHelper
     $nativeMethods = $Script:NativeMethodsType
     $blocked = $false
+    $testError = $null
     try {
         $blocked = $nativeMethods::StartInputBlocker(
             $Script:InputHookHelper)
@@ -1503,8 +1778,19 @@ function Invoke-SelfTest {
         }
         Start-Sleep -Milliseconds 250
     }
-    finally {
-        $null = $nativeMethods::StopInputBlocker()
+    catch {
+        $testError = $_
+    }
+
+    $releaseConfirmed = $nativeMethods::StopInputBlocker()
+    if (-not $releaseConfirmed) {
+        throw (('Native input helper release could not be confirmed while {0}; error {1}. ' +
+            'The helper remains tracked so release can be retried.') -f
+            $nativeMethods::GetBlockerStage(),
+            $nativeMethods::GetBlockerError())
+    }
+    if ($null -ne $testError) {
+        throw $testError
     }
     Write-Host 'Native non-admin input-hook self-test passed; input was released.' -ForegroundColor Green
 }
@@ -1515,6 +1801,27 @@ function Arm-Guard {
     $config = Get-GuardConfig
     $activeWifi = @(Get-ActiveWifiNames)
     $excludedWifi = Get-ExcludedWifiMatch -Config $config -ActiveNames $activeWifi
+
+    if ((Test-Path -LiteralPath $Script:ArmedPath) -and (Test-GuardReady)) {
+        Write-Host 'BLE Phone Input Guard is already armed and ready.' -ForegroundColor Green
+        return
+    }
+
+    # Do not race a stale or partially initialized hidden process.  Stop it
+    # before performing a fresh preflight and startup handshake.
+    if (Test-GuardProcess) {
+        Remove-Item -LiteralPath $Script:ArmedPath -Force -ErrorAction SilentlyContinue
+        New-Item -ItemType File -Path $Script:StopPath -Force | Out-Null
+        $oldProcessDeadline = [DateTime]::UtcNow.AddSeconds(6)
+        while ((Test-GuardProcess) -and [DateTime]::UtcNow -lt $oldProcessDeadline) {
+            Start-Sleep -Milliseconds 200
+        }
+        if (Test-GuardProcess) {
+            throw 'An earlier guard process is still stopping. Run Disarm before retrying Arm.'
+        }
+        Remove-Item -LiteralPath $Script:StopPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $Script:ReadyPath -Force -ErrorAction SilentlyContinue
+    }
 
     if ($null -eq $excludedWifi) {
         Write-Host 'Checking the BLE phone before arming (up to 10 seconds)...'
@@ -1529,12 +1836,64 @@ function Arm-Guard {
         Write-Host ('Exclusion Wi-Fi active: ' + [string]$excludedWifi)
     }
 
-    New-Item -ItemType File -Path $Script:ArmedPath -Force | Out-Null
+    Remove-Item -LiteralPath $Script:ReadyPath -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath ($Script:ReadyPath + '.tmp') -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $Script:StopPath -Force -ErrorAction SilentlyContinue
-    Start-GuardProcess
-    Start-Sleep -Milliseconds 800
-    if (-not (Test-GuardProcess)) {
-        throw 'The guard process did not remain running. Check windows-ble-guard.log.'
+    New-Item -ItemType File -Path $Script:ArmedPath -Force | Out-Null
+
+    $startedProcess = $null
+    try {
+        $startedProcess = Start-GuardProcess
+    }
+    catch {
+        Remove-Item -LiteralPath $Script:ArmedPath -Force -ErrorAction SilentlyContinue
+        throw
+    }
+
+    $ready = $false
+    $deadline = [DateTime]::UtcNow.AddSeconds(20)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        if (Test-GuardReady) {
+            # Require the ready signal and process to remain valid briefly.
+            Start-Sleep -Milliseconds 400
+            if (Test-GuardReady) {
+                $ready = $true
+                break
+            }
+        }
+        if ($null -ne $startedProcess) {
+            try {
+                $startedProcess.Refresh()
+                if ($startedProcess.HasExited) {
+                    break
+                }
+            }
+            catch {
+                break
+            }
+        }
+        Start-Sleep -Milliseconds 200
+    }
+
+    if (-not $ready) {
+        # Roll back the armed flag first.  A process still compiling the
+        # bridges will then return before it can enter the monitoring loop.
+        Remove-Item -LiteralPath $Script:ArmedPath -Force -ErrorAction SilentlyContinue
+        New-Item -ItemType File -Path $Script:StopPath -Force | Out-Null
+        $stopDeadline = [DateTime]::UtcNow.AddSeconds(6)
+        while ((Test-GuardProcess) -and [DateTime]::UtcNow -lt $stopDeadline) {
+            Start-Sleep -Milliseconds 200
+        }
+        $stillRunning = Test-GuardProcess
+        if (-not $stillRunning) {
+            Remove-Item -LiteralPath $Script:StopPath -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $Script:ReadyPath -Force -ErrorAction SilentlyContinue
+        }
+        if ($stillRunning) {
+            throw ('The guard did not become ready within 20 seconds. It is disarmed and a stop ' +
+                'was requested; check windows-ble-guard.log before retrying.')
+        }
+        throw 'The guard did not become ready within 20 seconds and was stopped. Check windows-ble-guard.log.'
     }
     Write-Host 'BLE Phone Input Guard is armed and will start automatically at sign-in.' -ForegroundColor Green
 }
@@ -1556,6 +1915,8 @@ function Disarm-Guard {
     }
     else {
         Remove-Item -LiteralPath $Script:StopPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $Script:ReadyPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath ($Script:ReadyPath + '.tmp') -Force -ErrorAction SilentlyContinue
         Write-Host 'BLE Phone Input Guard is disarmed; input is released.' -ForegroundColor Green
     }
 }
@@ -1585,6 +1946,7 @@ function Show-GuardCheck {
         Installed           = $installed
         Armed               = Test-Path -LiteralPath $Script:ArmedPath
         ProcessRunning      = Test-GuardProcess
+        ProcessReady        = Test-GuardReady
         StartupEntry        = if ($null -ne $startupValue) { 'Installed' } else { 'Missing' }
         ServiceUuid         = if ($installed) { [string]$config.service_uuid } else { 'Not configured' }
         LockRssi            = if ($installed) { [int]$config.lock_rssi_dbm } else { $null }

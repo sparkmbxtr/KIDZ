@@ -37,40 +37,60 @@ sudo /usr/local/sbin/phone-input-guard uninstall
 
 To change the public placeholder marker, edit `PANEL_MARKER_TEXT = "XX"` before installing.
 
-## Microsoft Windows 10/11
+## Microsoft Windows 10/11: BLE guard without administrator access
 
-The Windows implementation uses the supported Win32 Bluetooth connected flag and `BlockInput`, and installs an interactive Scheduled Task for the current user. Unlike the Linux implementation, the classic Windows Bluetooth API used here does not expose link RSSI; Windows freezes input when it declares the phone disconnected.
+`phone-input-guard-windows-ble.ps1` is the recommended Windows implementation. It listens for a private 128-bit BLE service UUID advertised by the phone, classifies near/far state from RSSI plus missing advertisements, and uses a verified native helper to suppress keyboard and mouse input in the current desktop session. It installs entirely within the current user's profile and does not require administrator access.
 
-Pair the phone first. Then open **Windows PowerShell as Administrator** in the repository folder and run:
+Configure a phone BLE advertiser with a new, unique 128-bit service UUID. A legacy, non-connectable advertisement at roughly 250 ms works well. The UUID is broadcast in cleartext: uniqueness prevents accidental matches, but it is not authentication and a nearby transmitter could replay it. The public repository deliberately contains only a zero UUID placeholder.
+
+Keep `phone-input-guard-windows-ble.ps1` and `windows-input-hook-helper.exe` in the same folder. Open ordinary **Windows PowerShell 5.1** in that folder and run:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\phone-input-guard-windows.ps1 Install `
-  -PhoneAddress "XX:XX:XX:XX:XX:XX" `
-  -PhoneName "XX" `
-  -ExcludedWifiNames "XX1","XX2","XX3" `
+Unblock-File -LiteralPath '.\phone-input-guard-windows-ble.ps1', '.\windows-input-hook-helper.exe'
+
+.\phone-input-guard-windows-ble.ps1 Install `
+  -ServiceUuid '00000000-0000-4000-8000-000000000000' `
+  -LockRssi -84 `
+  -UnlockRssi -80 `
+  -AbsenceSeconds 8 `
+  -ExcludedWifiNames @('XX1','XX2','XX3') `
   -BannerText "XX"
 ```
 
-Replace every `XX` value in that command. The installer refuses to arm immediately if it cannot see either the connected phone or an excluded Wi-Fi profile.
+Replace the zero UUID and each `XX` value. `LockRssi` is the weak-signal threshold, `UnlockRssi` is the stronger return threshold, and `AbsenceSeconds` is the time without a matching packet that counts as far. The gap between the two RSSI thresholds is hysteresis, which reduces rapid toggling near the boundary.
 
-Useful commands, also from an Administrator PowerShell:
+Installation creates the per-user startup entry but deliberately leaves the guard disarmed. Validate it in this order:
 
 ```powershell
-.\phone-input-guard-windows.ps1 Check
-.\phone-input-guard-windows.ps1 Arm
-.\phone-input-guard-windows.ps1 Disarm
-.\phone-input-guard-windows.ps1 Uninstall
+.\phone-input-guard-windows-ble.ps1 Observe -ObserveSeconds 90
+.\phone-input-guard-windows-ble.ps1 SelfTest
+.\phone-input-guard-windows-ble.ps1 Arm
+.\phone-input-guard-windows-ble.ps1 Check
 ```
 
-Windows deliberately releases `BlockInput` when `Ctrl+Alt+Delete` is pressed. The guard reasserts the block after returning to the desktop, but it cannot suppress the Windows secure-attention screen. Preventing that would require an unsafe kernel input-filter driver and is intentionally outside this project.
+Useful control commands:
+
+```powershell
+.\phone-input-guard-windows-ble.ps1 Disarm
+.\phone-input-guard-windows-ble.ps1 Uninstall
+```
+
+`Arm` performs a ten-second BLE preflight and refuses to start unless the phone is near or an exclusion Wi-Fi is active. The native helper is assigned to a kill-on-close Windows job, and the PowerShell parent confirms helper exit before reporting that input was released.
+
+Windows reserves `Ctrl+Alt+Delete` for its secure-attention screen, so a user-mode input hook cannot suppress it. This is one reason KIDZ is a brief-absence convenience guard rather than a substitute for locking Windows.
+
+### Legacy Windows connected-device guard
+
+`phone-input-guard-windows.ps1` is retained for systems where a continuously connected classic-Bluetooth device is reliable. It uses `BlockInput`, requires an elevated Administrator PowerShell, and does not measure Bluetooth RSSI. The BLE implementation above is preferable when the phone can advertise a private service UUID.
 
 ## Safe test
 
-1. Connect the charger and confirm the phone is connected.
-2. Run `check` and verify that it reports the phone as present/connected and that input would not currently freeze.
-3. Keep the charger within reach.
-4. Turn off Bluetooth on the phone.
-5. Confirm that input freezes and the marker appears.
-6. Turn phone Bluetooth back on, or exercise the three-cycle charger rescue.
+1. Save open work and keep the charger within reach.
+2. Make sure no configured exclusion Wi-Fi is active.
+3. Start the phone advertisement and run `Observe`; verify that matching packets appear and the state becomes `NEAR`.
+4. Run `SelfTest`; it must explicitly report that the test passed and input was released.
+5. Run `Arm`, then `Check`; `Armed`, `ProcessRunning`, and `ProcessReady` must all be `True`.
+6. Stop the phone advertisement. Confirm that input freezes and the marker appears after the configured timeout.
+7. Restart the advertisement and confirm release. Separately test the emergency release by completing three charger unplug/replug cycles within 60 seconds, keeping every state stable for at least one second.
 
 Do not first test this while unsaved work is open.
