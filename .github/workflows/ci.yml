@@ -15,6 +15,25 @@ jobs:
       - name: Compile Python source
         run: python3 -m py_compile phone-input-guard.py
 
+  windows-native-helper:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rebuild and verify native input helper
+        run: |
+          as --64 -o /tmp/windows-input-hook-helper.o windows-input-hook-helper.S
+          ld -mi386pep --subsystem windows --entry start --strip-all \
+            --image-base 0x140000000 --file-alignment 512 --section-alignment 4096 \
+            --disable-dynamicbase --disable-high-entropy-va --disable-reloc-section \
+            --no-insert-timestamp \
+            -o /tmp/windows-input-hook-helper.exe /tmp/windows-input-hook-helper.o
+          cmp windows-input-hook-helper.exe /tmp/windows-input-hook-helper.exe
+          printf '%s  %s\n' \
+            '0adc71ca80b19003db434b2bff0bf3dc63bb686d180095e67f6478c77d8c2d66' \
+            'windows-input-hook-helper.exe' | sha256sum --check
+          objdump -p windows-input-hook-helper.exe | grep -F 'SetWindowsHookExW'
+          objdump -p windows-input-hook-helper.exe | grep -F 'UnhookWindowsHookEx'
+
   windows-powershell:
     runs-on: windows-latest
     steps:
@@ -43,4 +62,7 @@ jobs:
           .\windows-ble-scan.ps1 `
             -ServiceUuid '00000000-0000-4000-8000-000000000000' `
             -CompileOnly
+          .\phone-input-guard-windows-ble.ps1 CompileOnly
+          # Run again in the same Windows PowerShell process. This verifies
+          # that the source-hashed bridge identities safely reuse loaded DLLs.
           .\phone-input-guard-windows-ble.ps1 CompileOnly
