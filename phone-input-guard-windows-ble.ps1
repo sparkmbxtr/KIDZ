@@ -24,7 +24,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('Install', 'Run', 'Observe', 'Check', 'SelfTest', 'Arm', 'Disarm', 'Uninstall', 'CompileOnly')]
+    [ValidateSet('Install', 'Run', 'Startup', 'RepairStartup', 'Observe', 'Check', 'SelfTest', 'Arm', 'Disarm', 'Uninstall', 'CompileOnly')]
     [string]$Command = 'Check',
 
     [string]$ServiceUuid = '00000000-0000-4000-8000-000000000000',
@@ -43,13 +43,15 @@ param(
     [string]$BannerText = 'XX',
 
     [ValidateRange(5, 3600)]
-    [int]$ObserveSeconds = 60
+    [int]$ObserveSeconds = 60,
+
+    [switch]$StartupFallback
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$Script:GuardVersion = '2.1.3'
+$Script:GuardVersion = '2.2.0'
 $Script:NativeMethodsType = $null
 $Script:BleWatcherBridgeType = $null
 $Script:InstallRoot = Join-Path $env:LOCALAPPDATA 'KIDZ'
@@ -61,10 +63,13 @@ $Script:LogPath = Join-Path $Script:InstallRoot 'windows-ble-guard.log'
 $Script:StatePath = Join-Path $Script:InstallRoot 'windows-ble-state.json'
 $Script:PidPath = Join-Path $Script:InstallRoot 'windows-ble-guard.pid'
 $Script:ReadyPath = Join-Path $Script:InstallRoot 'windows-ble-ready.json'
+$Script:StartupStatePath = Join-Path $Script:InstallRoot 'windows-ble-startup.json'
 $Script:ArmedPath = Join-Path $Script:InstallRoot 'windows-ble-armed.flag'
 $Script:StopPath = Join-Path $Script:InstallRoot 'windows-ble-stop.flag'
 $Script:RunKeyPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $Script:RunValueName = 'KIDZ Phone Input Guard'
+$Script:RunApprovalKeyPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run'
+$Script:StartupTaskName = 'KIDZ Phone Input Guard Logon'
 
 function Assert-Windows {
     if ($env:OS -ne 'Windows_NT') {
@@ -101,6 +106,310 @@ function Write-GuardLog {
     }
     catch {
         # Logging must never determine whether input is blocked or released.
+    }
+}
+
+function Get-WindowsPowerShellPath {
+    return (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe')
+}
+
+function Get-StartupArguments {
+    param([switch]$RegistryFallback)
+
+    # Task Scheduler stores the executable and its arguments separately.  The
+    # script path is quoted because LocalAppData may contain spaces.
+    $arguments = ('-NoProfile -ExecutionPolicy Bypass ' +
+        '-WindowStyle Hidden -Sta -File "{0}" Startup') -f $Script:InstalledScript
+    if ($RegistryFallback) {
+        $arguments += ' -StartupFallback'
+    }
+    return $arguments
+}
+
+function Get-StartupRunCommand {
+    # HKCU Run is interpreted as a complete CreateProcess command line, so the
+    # executable as well as the script path must be quoted.
+    return ('"{0}" {1}' -f
+        (Get-WindowsPowerShellPath),
+        (Get-StartupArguments -RegistryFallback))
+}
+
+function Write-StartupState {
+    param(
+        [Parameter(Mandatory = $true)][string]$Status,
+        [Parameter(Mandatory = $true)][int]$Attempt,
+        [AllowEmptyString()][string]$Message = ''
+    )
+
+    try {
+        if (-not (Test-Path -LiteralPath $Script:InstallRoot)) {
+            return
+        }
+        $state = [pscustomobject][ordered]@{
+            updated_utc = [DateTime]::UtcNow.ToString('o')
+            pid         = $PID
+            version     = $Script:GuardVersion
+            status      = $Status
+            attempt     = $Attempt
+            message     = $Message
+        }
+        $temporaryPath = $Script:StartupStatePath + '.tmp'
+        $state | ConvertTo-Json -Depth 2 |
+            Set-Content -LiteralPath $temporaryPath -Encoding UTF8
+        Move-Item -LiteralPath $temporaryPath `
+            -Destination $Script:StartupStatePath -Force
+    }
+    catch {
+        Write-GuardLog ('Startup status write failed: ' + $_.Exception.Message)
+    }
+}
+
+function Get-RunStartupApproval {
+    if (-not (Test-Path -LiteralPath $Script:RunApprovalKeyPath)) {
+        return 'Enabled (no disabled override)'
+    }
+    try {
+        $item = Get-ItemProperty -Path $Script:RunApprovalKeyPath -ErrorAction Stop
+        $property = $item.PSObject.Properties[$Script:RunValueName]
+        if ($null -eq $property) {
+            return 'Enabled (no disabled override)'
+        }
+        $value = $property.Value
+        if (($value -is [byte[]]) -and ($value.Count -gt 0)) {
+            switch ([int]$value[0]) {
+                2 { return 'Enabled' }
+                3 { return 'Disabled by Windows startup settings' }
+                default { return ('Unknown ({0})' -f [int]$value[0]) }
+            }
+        }
+        return 'Unknown'
+    }
+    catch {
+        return 'Unknown'
+    }
+}
+
+function Get-StartupTaskInfo {
+    $stateNames = @{
+        0 = 'Unknown'
+        1 = 'Disabled'
+        2 = 'Queued'
+        3 = 'Ready'
+        4 = 'Running'
+    }
+    try {
+        $service = New-Object -ComObject 'Schedule.Service'
+        $service.Connect()
+        $task = $service.GetFolder('\').GetTask('\' + $Script:StartupTaskName)
+        $stateNumber = [int]$task.State
+        $lastResultUnsigned = [BitConverter]::ToUInt32(
+            [BitConverter]::GetBytes([int32]$task.LastTaskResult),
+            0)
+        $stateText = if ($stateNames.ContainsKey($stateNumber)) {
+            [string]$stateNames[$stateNumber]
+        }
+        else {
+            'Unknown (' + $stateNumber + ')'
+        }
+        return [pscustomobject]@{
+            Registered = $true
+            Enabled    = [bool]$task.Enabled
+            State      = $stateText
+            LastResult = ('0x{0:X8}' -f $lastResultUnsigned)
+            Error      = $null
+        }
+    }
+    catch {
+        return [pscustomobject]@{
+            Registered = $false
+            Enabled    = $false
+            State      = 'Missing'
+            LastResult = $null
+            Error      = $_.Exception.Message
+        }
+    }
+}
+
+function Install-StartupLaunchers {
+    Assert-Windows
+    if (-not (Test-Path -LiteralPath $Script:InstalledScript -PathType Leaf)) {
+        throw 'Installed guard script is missing. Run Install again.'
+    }
+
+    $runCommand = Get-StartupRunCommand
+    $runInstalled = $false
+    $runError = $null
+    try {
+        if ($runCommand.Length -le 260) {
+            New-Item -Path $Script:RunKeyPath -Force -ErrorAction Stop | Out-Null
+            New-ItemProperty -Path $Script:RunKeyPath -Name $Script:RunValueName `
+                -Value $runCommand -PropertyType String -Force -ErrorAction Stop | Out-Null
+            $runInstalled = $true
+        }
+        else {
+            $runError = ('The HKCU Run command is {0} characters; Windows allows 260.' -f
+                $runCommand.Length)
+            if (Test-Path -LiteralPath $Script:RunKeyPath) {
+                $runItem = Get-ItemProperty -Path $Script:RunKeyPath -ErrorAction Stop
+                if ($null -ne $runItem.PSObject.Properties[$Script:RunValueName]) {
+                    Remove-ItemProperty -Path $Script:RunKeyPath `
+                        -Name $Script:RunValueName -Force -ErrorAction Stop
+                }
+            }
+        }
+    }
+    catch {
+        $runError = $_.Exception.Message
+    }
+    if ($null -ne $runError) {
+        Write-GuardLog ('HKCU Run startup fallback was unavailable: ' + $runError)
+    }
+
+    # A previous Task Manager choice is recorded separately from the Run key.
+    # Removing only this program's approval record lets the newly repaired Run
+    # entry start again; it does not touch any other startup application.
+    $approvalReset = $true
+    $approvalError = $null
+    try {
+        if (Test-Path -LiteralPath $Script:RunApprovalKeyPath) {
+            $approvalItem = Get-ItemProperty -Path $Script:RunApprovalKeyPath `
+                -ErrorAction Stop
+            if ($null -ne $approvalItem.PSObject.Properties[$Script:RunValueName]) {
+                Remove-ItemProperty -Path $Script:RunApprovalKeyPath `
+                    -Name $Script:RunValueName -Force -ErrorAction Stop
+            }
+        }
+    }
+    catch {
+        $approvalReset = $false
+        $approvalError = $_.Exception.Message
+        Write-GuardLog ('Could not reset the Run startup approval record: ' + $approvalError)
+    }
+
+    $approvalState = Get-RunStartupApproval
+    $runUsable = $runInstalled -and (
+        $approvalReset -or $approvalState.StartsWith('Enabled', [StringComparison]::Ordinal))
+
+    $taskInstalled = $false
+    $taskError = $null
+    try {
+        # This task uses the current interactive user's token and limited run
+        # level.  It neither requests elevation nor stores a password.
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $userId = [string]$identity.Name
+        $service = New-Object -ComObject 'Schedule.Service'
+        $service.Connect()
+        $rootFolder = $service.GetFolder('\')
+        $definition = $service.NewTask(0)
+        $definition.RegistrationInfo.Description =
+            'Starts the KIDZ BLE input guard for the current user at sign-in.'
+        $definition.Principal.UserId = $userId
+        $definition.Principal.LogonType = 3 # TASK_LOGON_INTERACTIVE_TOKEN
+        $definition.Principal.RunLevel = 0 # TASK_RUNLEVEL_LUA (limited)
+
+        $settings = $definition.Settings
+        $settings.Enabled = $true
+        $settings.Hidden = $true
+        $settings.AllowDemandStart = $true
+        $settings.StartWhenAvailable = $true
+        $settings.DisallowStartIfOnBatteries = $false
+        $settings.StopIfGoingOnBatteries = $false
+        $settings.MultipleInstances = 2 # TASK_INSTANCES_IGNORE_NEW
+        $settings.ExecutionTimeLimit = 'PT0S'
+        $settings.RestartCount = 3
+        $settings.RestartInterval = 'PT1M'
+
+        $trigger = $definition.Triggers.Create(9) # TASK_TRIGGER_LOGON
+        $trigger.Enabled = $true
+        $trigger.UserId = $userId
+        $trigger.Delay = 'PT5S'
+
+        $action = $definition.Actions.Create(0) # TASK_ACTION_EXEC
+        $action.Path = Get-WindowsPowerShellPath
+        $action.Arguments = Get-StartupArguments
+        $action.WorkingDirectory = $Script:InstallRoot
+
+        # TASK_CREATE_OR_UPDATE=6.  InteractiveToken plus LUA keeps this a
+        # genuinely non-admin, same-desktop startup task.
+        $null = $rootFolder.RegisterTaskDefinition(
+            $Script:StartupTaskName,
+            $definition,
+            6,
+            $userId,
+            $null,
+            3,
+            $null)
+        $taskInstalled = $true
+    }
+    catch {
+        # Some managed PCs forbid users from creating scheduled tasks.  The
+        # HKCU Run entry remains a complete non-admin fallback.
+        $taskError = $_.Exception.Message
+        Write-GuardLog ('Per-user scheduled startup task was unavailable. Error: ' +
+            $taskError)
+    }
+
+    if ((-not $runUsable) -and (-not $taskInstalled)) {
+        throw (('No automatic startup launcher could be installed. HKCU Run: {0} ' +
+            'Scheduled task: {1}') -f
+            $(if ($null -ne $runError) { $runError } elseif (-not $approvalReset) {
+                    $approvalError
+                } else { $approvalState }),
+            $taskError)
+    }
+
+    return [pscustomobject]@{
+        RunCommand    = $runCommand
+        RunInstalled  = $runInstalled
+        RunUsable     = $runUsable
+        RunError      = $runError
+        ApprovalReset = $approvalReset
+        ApprovalError = $approvalError
+        ApprovalState = $approvalState
+        TaskInstalled = $taskInstalled
+        TaskError     = $taskError
+    }
+}
+
+function Remove-StartupLaunchers {
+    $failures = @()
+    foreach ($registryTarget in @(
+            [pscustomobject]@{ Path = $Script:RunKeyPath; Name = $Script:RunValueName },
+            [pscustomobject]@{ Path = $Script:RunApprovalKeyPath; Name = $Script:RunValueName }
+        )) {
+        try {
+            if (Test-Path -LiteralPath $registryTarget.Path) {
+                $item = Get-ItemProperty -Path $registryTarget.Path -ErrorAction Stop
+                if ($null -ne $item.PSObject.Properties[$registryTarget.Name]) {
+                    Remove-ItemProperty -Path $registryTarget.Path `
+                        -Name $registryTarget.Name -Force -ErrorAction Stop
+                }
+            }
+        }
+        catch {
+            $failures += ('Registry launcher removal failed for {0}: {1}' -f
+                $registryTarget.Path, $_.Exception.Message)
+        }
+    }
+    try {
+        $service = New-Object -ComObject 'Schedule.Service'
+        $service.Connect()
+        $service.GetFolder('\').DeleteTask($Script:StartupTaskName, 0)
+    }
+    catch {
+        # HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) means the task is already
+        # absent.  Any other result must be surfaced so Uninstall cannot leave
+        # an orphaned launcher while claiming success.
+        $win32Code = ([long]$_.Exception.HResult) -band 65535
+        if ($win32Code -ne 2) {
+            $failures += ('Scheduled startup task removal failed: ' +
+                $_.Exception.Message)
+        }
+    }
+    if ($failures.Count -gt 0) {
+        $message = $failures -join ' '
+        Write-GuardLog $message
+        throw $message
     }
 }
 
@@ -1375,7 +1684,13 @@ function Test-GuardReady {
                 [StringComparison]::Ordinal)) {
             return $false
         }
-        return ($null -ne (Get-Process -Id $guardPid -ErrorAction Stop))
+        $process = Get-Process -Id $guardPid -ErrorAction Stop
+        $startProperty = $readyState.PSObject.Properties['process_start_utc_ticks']
+        if ($null -eq $startProperty) {
+            return $false
+        }
+        $actualStartTicks = $process.StartTime.ToUniversalTime().Ticks
+        return ([long]$startProperty.Value -eq [long]$actualStartTicks)
     }
     catch {
         return $false
@@ -1383,7 +1698,9 @@ function Test-GuardReady {
 }
 
 function Start-GuardProcess {
-    if (Test-GuardProcess) {
+    param([switch]$ForceAttempt)
+
+    if ((-not $ForceAttempt) -and (Test-GuardProcess)) {
         return $null
     }
     if (-not (Test-Path -LiteralPath $Script:InstalledScript)) {
@@ -1394,6 +1711,155 @@ function Start-GuardProcess {
         $Script:InstalledScript
     return (Start-Process -FilePath $windowsPowerShell -ArgumentList $arguments `
         -WindowStyle Hidden -PassThru)
+}
+
+function Invoke-StartupSupervisor {
+    Assert-Windows
+    Write-GuardLog ('Startup supervisor {0} invoked; fallback={1}.' -f
+        $Script:GuardVersion, [bool]$StartupFallback)
+
+    if (-not (Test-Path -LiteralPath $Script:ArmedPath)) {
+        Write-StartupState -Status 'Disarmed' -Attempt 0 `
+            -Message 'Startup did not run the guard because it is disarmed.'
+        Write-GuardLog 'Startup supervisor exited because the guard is disarmed.'
+        return
+    }
+
+    # The Run entry waits briefly so the scheduled task normally becomes the
+    # single long-lived supervisor.  If policy blocked that task, HKCU Run then
+    # takes over without requiring administrator access.
+    if ($StartupFallback) {
+        Start-Sleep -Seconds 12
+        if (Test-GuardReady) {
+            Write-StartupState -Status 'Ready' -Attempt 0 `
+                -Message 'The scheduled startup task started the guard.'
+            return
+        }
+    }
+
+    $createdNew = $false
+    $supervisorMutex = New-Object Threading.Mutex(
+        $true,
+        'Local\XX-Phone-Input-Guard-Startup-Supervisor-V1',
+        [ref]$createdNew)
+    if (-not $createdNew) {
+        if ($StartupFallback) {
+            $supervisorMutex.Dispose()
+            Write-GuardLog 'A startup supervisor is already running.'
+            return
+        }
+
+        # If HKCU Run won the race, keep the scheduled-task process as a quiet
+        # standby.  It takes over only if the first supervisor exits or dies.
+        Write-GuardLog 'Scheduled startup task is waiting behind another supervisor.'
+        while (Test-Path -LiteralPath $Script:ArmedPath) {
+            try {
+                if ($supervisorMutex.WaitOne(5000)) {
+                    $createdNew = $true
+                    Write-GuardLog 'Scheduled startup task took over supervision.'
+                    break
+                }
+            }
+            catch [Threading.AbandonedMutexException] {
+                $createdNew = $true
+                Write-GuardLog 'Scheduled startup task recovered abandoned supervision.'
+                break
+            }
+        }
+        if (-not $createdNew) {
+            $supervisorMutex.Dispose()
+            return
+        }
+    }
+
+    $attempt = 0
+    $readyReported = $false
+    try {
+        while (Test-Path -LiteralPath $Script:ArmedPath) {
+            if (Test-GuardReady) {
+                if (-not $readyReported) {
+                    Write-StartupState -Status 'Ready' -Attempt $attempt `
+                        -Message 'Guard process is ready; supervisor is monitoring it.'
+                    $readyReported = $true
+                }
+                Start-Sleep -Seconds 3
+                continue
+            }
+
+            $readyReported = $false
+            $attempt++
+            Write-StartupState -Status 'Starting' -Attempt $attempt `
+                -Message 'Launching the hidden guard process.'
+            Write-GuardLog ('Startup supervisor launch attempt {0}.' -f $attempt)
+
+            # Ignore an unverified stale PID file.  The guard's named mutex
+            # prevents duplicate active monitors if another process is real.
+            try {
+                $child = Start-GuardProcess -ForceAttempt
+            }
+            catch {
+                $detail = 'Guard process could not be launched: ' + $_.Exception.Message
+                Write-StartupState -Status 'Retrying' -Attempt $attempt -Message $detail
+                Write-GuardLog ('Startup launch attempt {0} failed: {1}' -f
+                    $attempt, $detail)
+                Start-Sleep -Seconds ([Math]::Min(30, 4 + ($attempt * 2)))
+                continue
+            }
+            $deadline = [DateTime]::UtcNow.AddSeconds(45)
+            while ((Test-Path -LiteralPath $Script:ArmedPath) -and
+                [DateTime]::UtcNow -lt $deadline) {
+                if (Test-GuardReady) {
+                    break
+                }
+                try {
+                    $child.Refresh()
+                    if ($child.HasExited) {
+                        break
+                    }
+                }
+                catch {
+                    break
+                }
+                Start-Sleep -Milliseconds 250
+            }
+
+            if (Test-GuardReady) {
+                Write-GuardLog ('Startup launch attempt {0} became ready.' -f $attempt)
+                continue
+            }
+            if (-not (Test-Path -LiteralPath $Script:ArmedPath)) {
+                break
+            }
+
+            $detail = 'Guard exited before its readiness handshake.'
+            try {
+                $child.Refresh()
+                if (-not $child.HasExited) {
+                    # This exact child has not reached the readiness point in
+                    # 45 seconds.  It cannot yet have started input blocking.
+                    Stop-Process -Id $child.Id -Force -ErrorAction Stop
+                    $detail = 'Guard initialization timed out and was stopped.'
+                }
+                else {
+                    $detail += ' Exit code=' + [string]$child.ExitCode + '.'
+                }
+            }
+            catch {
+                $detail += ' ' + $_.Exception.Message
+            }
+            Write-StartupState -Status 'Retrying' -Attempt $attempt -Message $detail
+            Write-GuardLog ('Startup launch attempt {0} failed: {1}' -f $attempt, $detail)
+            Start-Sleep -Seconds ([Math]::Min(30, 4 + ($attempt * 2)))
+        }
+
+        Write-StartupState -Status 'Disarmed' -Attempt $attempt `
+            -Message 'Startup supervisor stopped because the guard was disarmed.'
+        Write-GuardLog 'Startup supervisor stopped because the guard was disarmed.'
+    }
+    finally {
+        $supervisorMutex.ReleaseMutex()
+        $supervisorMutex.Dispose()
+    }
 }
 
 function Test-BleNearNow {
@@ -1538,10 +2004,13 @@ function Invoke-GuardLoop {
 
     try {
         $bridge.Start()
+        $currentProcess = Get-Process -Id $PID -ErrorAction Stop
+        $processStartTicks = $currentProcess.StartTime.ToUniversalTime().Ticks
         $readyState = [pscustomobject][ordered]@{
-            pid       = $PID
-            ready_utc = [DateTime]::UtcNow.ToString('o')
-            version   = $Script:GuardVersion
+            pid                     = $PID
+            process_start_utc_ticks = $processStartTicks
+            ready_utc               = [DateTime]::UtcNow.ToString('o')
+            version                 = $Script:GuardVersion
         }
         $temporaryReadyPath = $Script:ReadyPath + '.tmp'
         $readyState | ConvertTo-Json -Depth 2 |
@@ -1742,12 +2211,7 @@ function Install-Guard {
     Assert-InputHookHelper -Path $helperDestinationPath
     $config | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $Script:ConfigPath -Encoding UTF8
 
-    $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    $runCommand = '"{0}" -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -Sta -File "{1}" Run' -f
-        $windowsPowerShell, $Script:InstalledScript
-    New-Item -Path $Script:RunKeyPath -Force | Out-Null
-    New-ItemProperty -Path $Script:RunKeyPath -Name $Script:RunValueName `
-        -Value $runCommand -PropertyType String -Force | Out-Null
+    $startupInstall = Install-StartupLaunchers
 
     Remove-Item -LiteralPath $Script:ArmedPath -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $Script:StopPath -Force -ErrorAction SilentlyContinue
@@ -1757,8 +2221,44 @@ function Install-Guard {
     Write-Host 'Installed for the current user without administrator access.' -ForegroundColor Green
     Write-Host ('Installed script: ' + $Script:InstalledScript)
     Write-Host ('Native input helper: ' + $Script:InputHookHelper)
+    if ([bool]$startupInstall.RunUsable) {
+        Write-Host 'HKCU Run startup fallback: installed and enabled.'
+    }
+    else {
+        Write-Warning ('HKCU Run startup fallback was unavailable. ' +
+            [string]$startupInstall.RunError + ' ' +
+            [string]$startupInstall.ApprovalError)
+    }
+    if ([bool]$startupInstall.TaskInstalled) {
+        Write-Host 'Per-user scheduled startup task: installed (limited, interactive token).'
+    }
+    else {
+        Write-Warning ('Scheduled startup task was unavailable. ' +
+            [string]$startupInstall.TaskError)
+    }
     Write-Host 'The startup entry is installed, but the guard is deliberately DISARMED.' -ForegroundColor Yellow
     Write-Host 'Run Observe, then SelfTest, and finally Arm.'
+}
+
+function Repair-GuardStartup {
+    Assert-Windows
+    [void](Get-GuardConfig)
+    $startupInstall = Install-StartupLaunchers
+    if ([bool]$startupInstall.RunUsable) {
+        Write-Host 'The current-user HKCU Run fallback was repaired.' -ForegroundColor Green
+    }
+    else {
+        Write-Warning ('HKCU Run fallback was unavailable. ' +
+            [string]$startupInstall.RunError + ' ' +
+            [string]$startupInstall.ApprovalError)
+    }
+    if ([bool]$startupInstall.TaskInstalled) {
+        Write-Host 'The limited per-user scheduled startup task was installed.' -ForegroundColor Green
+    }
+    else {
+        Write-Warning ('Scheduled startup task was unavailable. ' +
+            [string]$startupInstall.TaskError)
+    }
 }
 
 function Invoke-SelfTest {
@@ -1799,6 +2299,7 @@ function Arm-Guard {
     Assert-Windows
     Initialize-NativeMethods
     $config = Get-GuardConfig
+    $null = Install-StartupLaunchers
     $activeWifi = @(Get-ActiveWifiNames)
     $excludedWifi = Get-ExcludedWifiMatch -Config $config -ActiveNames $activeWifi
 
@@ -1931,6 +2432,29 @@ function Show-GuardCheck {
     }
     catch {
     }
+    $expectedStartupValue = Get-StartupRunCommand
+    $runEntryStatus = if ($null -eq $startupValue) {
+        'Missing'
+    }
+    elseif ([string]::Equals(
+            [string]$startupValue,
+            $expectedStartupValue,
+            [StringComparison]::Ordinal)) {
+        'Installed'
+    }
+    else {
+        'Outdated or changed'
+    }
+    $startupTask = Get-StartupTaskInfo
+    $startupState = $null
+    if (Test-Path -LiteralPath $Script:StartupStatePath) {
+        try {
+            $startupState = Get-Content -LiteralPath $Script:StartupStatePath -Raw |
+                ConvertFrom-Json
+        }
+        catch {
+        }
+    }
 
     $config = if ($installed) { Get-GuardConfig } else { $null }
     $activeWifi = @(Get-ActiveWifiNames)
@@ -1947,7 +2471,22 @@ function Show-GuardCheck {
         Armed               = Test-Path -LiteralPath $Script:ArmedPath
         ProcessRunning      = Test-GuardProcess
         ProcessReady        = Test-GuardReady
-        StartupEntry        = if ($null -ne $startupValue) { 'Installed' } else { 'Missing' }
+        StartupEntry        = $runEntryStatus
+        StartupRunApproval  = Get-RunStartupApproval
+        StartupTask         = if ([bool]$startupTask.Registered) {
+            if ([bool]$startupTask.Enabled) { [string]$startupTask.State } else { 'Disabled' }
+        }
+        else { 'Unavailable or missing' }
+        StartupTaskResult   = [string]$startupTask.LastResult
+        StartupTaskError    = [string]$startupTask.Error
+        StartupLastStatus   = if ($null -ne $startupState) {
+            '{0} at {1}' -f [string]$startupState.status, [string]$startupState.updated_utc
+        }
+        else { 'No startup attempt recorded yet' }
+        StartupLastMessage  = if ($null -ne $startupState) {
+            [string]$startupState.message
+        }
+        else { $null }
         ServiceUuid         = if ($installed) { [string]$config.service_uuid } else { 'Not configured' }
         LockRssi            = if ($installed) { [int]$config.lock_rssi_dbm } else { $null }
         UnlockRssi          = if ($installed) { [int]$config.unlock_rssi_dbm } else { $null }
@@ -1964,6 +2503,11 @@ function Show-GuardCheck {
             Format-List |
             Out-Host
     }
+
+    if (Test-Path -LiteralPath $Script:LogPath) {
+        Write-Host 'Recent guard log:'
+        Get-Content -LiteralPath $Script:LogPath -Tail 12 | Out-Host
+    }
 }
 
 function Uninstall-Guard {
@@ -1973,8 +2517,7 @@ function Uninstall-Guard {
         throw 'Refusing to uninstall while the guard process is still running.'
     }
 
-    Remove-ItemProperty -Path $Script:RunKeyPath -Name $Script:RunValueName `
-        -Force -ErrorAction SilentlyContinue
+    Remove-StartupLaunchers
 
     if (Test-Path -LiteralPath $Script:InstallRoot) {
         $localRoot = [IO.Path]::GetFullPath($env:LOCALAPPDATA).TrimEnd('\') + '\'
@@ -1991,6 +2534,8 @@ try {
     switch ($Command) {
         'Install'     { Install-Guard }
         'Run'         { Invoke-GuardLoop }
+        'Startup'     { Invoke-StartupSupervisor }
+        'RepairStartup' { Repair-GuardStartup }
         'Observe'     { Invoke-Observe }
         'Check'       { Show-GuardCheck }
         'SelfTest'    { Invoke-SelfTest }
@@ -2009,6 +2554,8 @@ try {
     }
 }
 catch {
+    Write-GuardLog ('Command {0} failed: {1}' -f
+        $Command, $_.Exception.ToString())
     Write-Error $_
     exit 1
 }

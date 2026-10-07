@@ -6,7 +6,7 @@ This is a convenience guard for brief absences, not a replacement for the operat
 
 ## Shared behavior
 
-- Starts automatically after sign-in or boot.
+- Starts automatically after sign-in on Windows or at boot on Linux.
 - Does **not** pause when the laptop switches to battery power.
 - Releases input when an exact configured Wi-Fi name is active.
 - Keeps the display and system awake while input is frozen.
@@ -59,7 +59,12 @@ Unblock-File -LiteralPath '.\phone-input-guard-windows-ble.ps1', '.\windows-inpu
 
 Replace the zero UUID and each `XX` value. `LockRssi` is the weak-signal threshold, `UnlockRssi` is the stronger return threshold, and `AbsenceSeconds` is the time without a matching packet that counts as far. The gap between the two RSSI thresholds is hysteresis, which reduces rapid toggling near the boundary.
 
-Installation creates the per-user startup entry but deliberately leaves the guard disarmed. Validate it in this order:
+Installation creates two non-admin, per-user startup paths: a limited scheduled
+task that starts five seconds after sign-in and an HKCU Run fallback. The
+fallback waits briefly so both launchers cannot create competing supervisors.
+The startup supervisor retries transient Bluetooth/WinRT failures while the
+guard remains armed. Installation deliberately leaves the guard disarmed.
+Validate it in this order:
 
 ```powershell
 .\phone-input-guard-windows-ble.ps1 Observe -ObserveSeconds 90
@@ -72,8 +77,21 @@ Useful control commands:
 
 ```powershell
 .\phone-input-guard-windows-ble.ps1 Disarm
+.\phone-input-guard-windows-ble.ps1 RepairStartup
 .\phone-input-guard-windows-ble.ps1 Uninstall
 ```
+
+`RepairStartup` recreates both current-user launchers without changing the BLE
+configuration or armed state. It never requests elevation. On a managed PC
+that forbids users from creating scheduled tasks, the command reports that
+restriction and retains the HKCU Run fallback.
+
+`Check` reports the exact HKCU Run command status, Windows startup approval,
+scheduled-task state/result, the last startup-supervisor status, and the last
+12 guard log lines. This makes a failed sign-in start diagnosable without an
+Administrator PowerShell.  After repairing startup, sign out and sign back in
+(or restart Windows), wait about 30 seconds, and run `Check`; `Armed`,
+`ProcessRunning`, and `ProcessReady` should all be `True`.
 
 `Arm` performs a ten-second BLE preflight and refuses to start unless the phone is near or an exclusion Wi-Fi is active. The native helper is assigned to a kill-on-close Windows job, and the PowerShell parent confirms helper exit before reporting that input was released.
 
