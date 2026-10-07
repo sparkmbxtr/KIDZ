@@ -66,3 +66,65 @@ jobs:
           # Run again in the same Windows PowerShell process. This verifies
           # that the source-hashed bridge identities safely reuse loaded DLLs.
           .\phone-input-guard-windows-ble.ps1 CompileOnly
+      - name: Exercise per-user startup registration
+        shell: powershell
+        run: |
+          $source = (Resolve-Path '.\phone-input-guard-windows-ble.ps1').Path
+          & $source Install `
+            -ServiceUuid '11111111-1111-4111-8111-111111111111' `
+            -LockRssi -84 `
+            -UnlockRssi -80 `
+            -AbsenceSeconds 11 `
+            -ExcludedWifiNames @('XX1','XX2','XX3') `
+            -BannerText 'XX'
+
+          $installed = Join-Path $env:LOCALAPPDATA `
+            'KIDZ\phone-input-guard-windows-ble.ps1'
+          & $installed RepairStartup
+
+          $service = New-Object -ComObject 'Schedule.Service'
+          $service.Connect()
+          $root = $service.GetFolder('\')
+          $task = $root.GetTask('\KIDZ Phone Input Guard Logon')
+          if (-not $task.Enabled) {
+            throw 'The startup task was registered but is disabled.'
+          }
+          $action = $task.Definition.Actions.Item(1)
+          if (($action.Path -notlike '*\WindowsPowerShell\v1.0\powershell.exe') -or ($action.Arguments -notmatch '\bStartup\b')) {
+            throw 'The startup task action is not the expected PowerShell Startup command.'
+          }
+          if ($task.Definition.Settings.DisallowStartIfOnBatteries -or $task.Definition.Settings.StopIfGoingOnBatteries) {
+            throw 'The startup task incorrectly stops or refuses to start on battery power.'
+          }
+
+          $runValue = (Get-ItemProperty `
+            'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' `
+            -Name 'KIDZ Phone Input Guard').'KIDZ Phone Input Guard'
+          if (($runValue -notmatch '\bStartup\b') -or ($runValue -notmatch '-StartupFallback')) {
+            throw 'The HKCU Run fallback is not the expected Startup command.'
+          }
+
+          & $installed Check
+          & $installed Uninstall
+
+          try {
+            $null = $root.GetTask('\KIDZ Phone Input Guard Logon')
+            throw 'Uninstall left the startup task registered.'
+          }
+          catch {
+            if (([long]$_.Exception.HResult -band 65535) -ne 2) {
+              throw
+            }
+          }
+          $remainingRunValue = Get-ItemProperty `
+            'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' `
+            -Name 'KIDZ Phone Input Guard' `
+            -ErrorAction SilentlyContinue
+          if ($null -ne $remainingRunValue) {
+            throw 'Uninstall left the HKCU Run fallback registered.'
+          }
+
+          # Get-ActiveWifiNames uses netsh as one of its read-only probes.
+          # A runner without a WLAN interface can leave LASTEXITCODE=1 even
+          # though Check, task registration, and every assertion succeeded.
+          $global:LASTEXITCODE = 0
