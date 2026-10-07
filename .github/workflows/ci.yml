@@ -123,3 +123,8 @@ jobs:
           if ($null -ne $remainingRunValue) {
             throw 'Uninstall left the HKCU Run fallback registered.'
           }
+
+          # Get-ActiveWifiNames uses netsh as one of its read-only probes.
+          # A runner without a WLAN interface can leave LASTEXITCODE=1 even
+          # though Check, task registration, and every assertion succeeded.
+          $global:LASTEXITCODE = 0
