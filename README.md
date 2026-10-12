@@ -62,8 +62,9 @@ Replace the zero UUID and each `XX` value. `LockRssi` is the weak-signal thresho
 Installation creates two non-admin, per-user startup paths: a limited scheduled
 task that starts five seconds after sign-in and an HKCU Run fallback. The
 fallback waits briefly so both launchers cannot create competing supervisors.
-Both paths use a generated Windows Script Host shim, so startup is consoleless
-and no PowerShell window should flash at sign-in.
+Both paths use a locally generated Windows GUI-subsystem launcher. The launcher
+has no console and creates Windows PowerShell with `CREATE_NO_WINDOW`, so the
+default terminal cannot open a PowerShell window at sign-in.
 The startup supervisor retries transient Bluetooth/WinRT failures while the
 guard remains armed. Installation deliberately leaves the guard disarmed.
 Validate it in this order:

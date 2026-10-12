@@ -51,13 +51,15 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$Script:GuardVersion = '2.2.1'
+$Script:GuardVersion = '2.2.2'
 $Script:NativeMethodsType = $null
 $Script:BleWatcherBridgeType = $null
 $Script:InstallRoot = Join-Path $env:LOCALAPPDATA 'KIDZ'
 $Script:InstalledScript = Join-Path $Script:InstallRoot 'phone-input-guard-windows-ble.ps1'
 $Script:InputHookHelper = Join-Path $Script:InstallRoot 'windows-input-hook-helper.exe'
-$Script:StartupLauncher = Join-Path $Script:InstallRoot 'phone-input-guard-startup.vbs'
+$Script:StartupLauncherFileVersion = $Script:GuardVersion + '.0'
+$Script:StartupLauncher = Join-Path $Script:InstallRoot (
+    'phone-input-guard-startup-{0}.exe' -f $Script:GuardVersion)
 $Script:InputHookHelperSha256 = '0adc71ca80b19003db434b2bff0bf3dc63bb686d180095e67f6478c77d8c2d66'
 $Script:ConfigPath = Join-Path $Script:InstallRoot 'windows-ble-config.json'
 $Script:LogPath = Join-Path $Script:InstallRoot 'windows-ble-guard.log'
@@ -110,66 +112,264 @@ function Write-GuardLog {
     }
 }
 
-function Get-WindowsScriptHostPath {
-    return (Join-Path $env:SystemRoot 'System32\wscript.exe')
+function Test-WindowsGuiExecutable {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return $false
+    }
+    $stream = $null
+    $reader = $null
+    try {
+        $stream = [IO.File]::Open(
+            $Path,
+            [IO.FileMode]::Open,
+            [IO.FileAccess]::Read,
+            [IO.FileShare]::ReadWrite)
+        if ($stream.Length -lt 96) {
+            return $false
+        }
+        $reader = New-Object IO.BinaryReader($stream)
+        if ($reader.ReadUInt16() -ne 0x5A4D) {
+            return $false
+        }
+        $stream.Position = 0x3C
+        $peOffset = $reader.ReadInt32()
+        if (($peOffset -lt 64) -or (($peOffset + 94) -gt $stream.Length)) {
+            return $false
+        }
+        $stream.Position = $peOffset
+        if ($reader.ReadUInt32() -ne 0x00004550) {
+            return $false
+        }
+        $stream.Position = $peOffset + 24
+        $optionalHeaderMagic = $reader.ReadUInt16()
+        if (($optionalHeaderMagic -ne 0x010B) -and
+            ($optionalHeaderMagic -ne 0x020B)) {
+            return $false
+        }
+        # IMAGE_OPTIONAL_HEADER.Subsystem is 68 bytes into the optional
+        # header for both PE32 and PE32+.  Value 2 is Windows GUI.
+        $stream.Position = $peOffset + 24 + 68
+        return ($reader.ReadUInt16() -eq 2)
+    }
+    catch {
+        return $false
+    }
+    finally {
+        if ($null -ne $reader) {
+            $reader.Dispose()
+        }
+        elseif ($null -ne $stream) {
+            $stream.Dispose()
+        }
+    }
+}
+
+function Test-StartupLauncher {
+    if (-not (Test-WindowsGuiExecutable -Path $Script:StartupLauncher)) {
+        return $false
+    }
+    try {
+        $fileVersion = [Diagnostics.FileVersionInfo]::GetVersionInfo(
+            $Script:StartupLauncher).FileVersion
+        return [string]::Equals(
+            [string]$fileVersion,
+            $Script:StartupLauncherFileVersion,
+            [StringComparison]::Ordinal)
+    }
+    catch {
+        return $false
+    }
+}
+
+function Get-RunningStartupLaunchers {
+    $installPrefix = [IO.Path]::GetFullPath($Script:InstallRoot).TrimEnd('\') + '\'
+    return @(Get-Process -ErrorAction SilentlyContinue | ForEach-Object {
+            try {
+                $processPath = [string]$_.Path
+                $fileName = [IO.Path]::GetFileName($processPath)
+                if ($processPath.StartsWith(
+                        $installPrefix,
+                        [StringComparison]::OrdinalIgnoreCase) -and
+                    $fileName.StartsWith(
+                        'phone-input-guard-startup-',
+                        [StringComparison]::OrdinalIgnoreCase) -and
+                    $fileName.EndsWith('.exe', [StringComparison]::OrdinalIgnoreCase)) {
+                    $_
+                }
+            }
+            catch {
+            }
+        })
+}
+
+function Wait-StartupLaunchersExit {
+    param([ValidateRange(1, 30)][int]$Seconds = 10)
+
+    $deadline = [DateTime]::UtcNow.AddSeconds($Seconds)
+    while ((@(Get-RunningStartupLaunchers).Count -gt 0) -and
+        ([DateTime]::UtcNow -lt $deadline)) {
+        Start-Sleep -Milliseconds 200
+    }
+    return (@(Get-RunningStartupLaunchers).Count -eq 0)
 }
 
 function Write-StartupLauncher {
-    # wscript.exe has no console window.  It starts the existing PowerShell
-    # supervisor hidden, so neither the scheduled task nor the HKCU fallback
-    # flashes a shell at sign-in.  Deriving the paths at runtime also avoids
-    # embedding a user profile name in this generated file.
-    $launcher = @'
-Option Explicit
+    # A GUI-subsystem executable has no console of its own.  CREATE_NO_WINDOW
+    # also prevents its Windows PowerShell child from acquiring a console, so
+    # a default-terminal redirector cannot turn a hidden startup into a flash.
+    # The versioned filename avoids replacing an image that an armed, long-lived
+    # startup supervisor still has open during a software update.
+    if (Test-StartupLauncher) {
+        return
+    }
 
-Dim shell, fso, installRoot, guardPath, powerShellPath, commandLine, mode, extra, exitCode
-Set shell = CreateObject("WScript.Shell")
-Set fso = CreateObject("Scripting.FileSystemObject")
+    $buildToken = [Guid]::NewGuid().ToString('N')
+    $launcherSource = @"
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Reflection;
 
-If WScript.Arguments.Count <> 1 Then WScript.Quit 64
-mode = LCase(CStr(WScript.Arguments.Item(0)))
-Select Case mode
-    Case "task"
-        extra = ""
-    Case "fallback"
-        extra = " -StartupFallback"
-    Case Else
-        WScript.Quit 64
-End Select
+[assembly: AssemblyVersion("$($Script:StartupLauncherFileVersion)")]
+[assembly: AssemblyFileVersion("$($Script:StartupLauncherFileVersion)")]
 
-installRoot = fso.GetParentFolderName(WScript.ScriptFullName)
-guardPath = fso.BuildPath(installRoot, "phone-input-guard-windows-ble.ps1")
-powerShellPath = shell.ExpandEnvironmentStrings("%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe")
-If Not fso.FileExists(guardPath) Or Not fso.FileExists(powerShellPath) Then WScript.Quit 2
+namespace XXPhoneInputGuardStartup_$buildToken
+{
+    public static class Program
+    {
+        [STAThread]
+        public static int Main(string[] args)
+        {
+            try
+            {
+                if (args == null || args.Length != 1)
+                {
+                    return 64;
+                }
 
-commandLine = QuoteArgument(powerShellPath) & " -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -Sta -File " & QuoteArgument(guardPath) & " Startup" & extra
-exitCode = shell.Run(commandLine, 0, True)
-WScript.Quit exitCode
+                bool fallback;
+                if (string.Equals(args[0], "task", StringComparison.OrdinalIgnoreCase))
+                {
+                    fallback = false;
+                }
+                else if (string.Equals(args[0], "fallback", StringComparison.OrdinalIgnoreCase))
+                {
+                    fallback = true;
+                }
+                else
+                {
+                    return 64;
+                }
 
-Function QuoteArgument(ByVal value)
-    QuoteArgument = Chr(34) & value & Chr(34)
-End Function
-'@
+                string launcherPath = Assembly.GetExecutingAssembly().Location;
+                string installRoot = Path.GetDirectoryName(launcherPath);
+                string guardPath = Path.Combine(
+                    installRoot,
+                    "phone-input-guard-windows-ble.ps1");
 
-    $temporaryPath = $Script:StartupLauncher + '.tmp'
-    $launcher | Set-Content -LiteralPath $temporaryPath -Encoding ASCII
-    Move-Item -LiteralPath $temporaryPath -Destination $Script:StartupLauncher -Force
+                string systemDirectory = Environment.GetFolderPath(
+                    Environment.SpecialFolder.System);
+                if (Environment.Is64BitOperatingSystem && !Environment.Is64BitProcess)
+                {
+                    systemDirectory = Path.Combine(
+                        Environment.GetFolderPath(Environment.SpecialFolder.Windows),
+                        "Sysnative");
+                }
+                string powerShellPath = Path.Combine(
+                    systemDirectory,
+                    "WindowsPowerShell",
+                    "v1.0",
+                    "powershell.exe");
+                if (!File.Exists(guardPath) || !File.Exists(powerShellPath))
+                {
+                    return 2;
+                }
+
+                string arguments =
+                    "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass " +
+                    "-WindowStyle Hidden -Sta -File " + Quote(guardPath) + " Startup";
+                if (fallback)
+                {
+                    arguments += " -StartupFallback";
+                }
+
+                ProcessStartInfo startInfo = new ProcessStartInfo();
+                startInfo.FileName = powerShellPath;
+                startInfo.Arguments = arguments;
+                startInfo.WorkingDirectory = installRoot;
+                startInfo.UseShellExecute = false;
+                startInfo.CreateNoWindow = true;
+                startInfo.WindowStyle = ProcessWindowStyle.Hidden;
+                startInfo.ErrorDialog = false;
+
+                using (Process process = Process.Start(startInfo))
+                {
+                    if (process == null)
+                    {
+                        return 2;
+                    }
+                    process.WaitForExit();
+                    return process.ExitCode;
+                }
+            }
+            catch
+            {
+                return 2;
+            }
+        }
+
+        private static string Quote(string value)
+        {
+            return "\"" + value + "\"";
+        }
+    }
+}
+"@
+
+    $temporaryPath = Join-Path $Script:InstallRoot (
+        'phone-input-guard-startup-{0}.tmp.exe' -f $buildToken)
+    try {
+        Add-Type -TypeDefinition $launcherSource -Language CSharp `
+            -OutputAssembly $temporaryPath -OutputType WindowsApplication `
+            -ErrorAction Stop
+        if (-not (Test-WindowsGuiExecutable -Path $temporaryPath)) {
+            throw 'The compiled startup launcher is not a Windows GUI executable.'
+        }
+        $compiledVersion = [Diagnostics.FileVersionInfo]::GetVersionInfo(
+            $temporaryPath).FileVersion
+        if (-not [string]::Equals(
+                [string]$compiledVersion,
+                $Script:StartupLauncherFileVersion,
+                [StringComparison]::Ordinal)) {
+            throw ('The compiled startup launcher has unexpected version {0}.' -f
+                [string]$compiledVersion)
+        }
+        Move-Item -LiteralPath $temporaryPath `
+            -Destination $Script:StartupLauncher -Force
+        Unblock-File -LiteralPath $Script:StartupLauncher -ErrorAction SilentlyContinue
+    }
+    catch {
+        throw (('Could not create the consoleless native startup launcher. ' +
+            'Disarm the guard, wait for it to stop, then run RepairStartup. {0}') -f
+            $_.Exception.Message)
+    }
+    finally {
+        Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Get-StartupArguments {
     param([switch]$RegistryFallback)
 
-    # Both startup paths call the consoleless launcher.  //B suppresses WSH
-    # error dialogs and //Nologo keeps the launch completely silent.
-    $mode = if ($RegistryFallback) { 'fallback' } else { 'task' }
-    return (('//B //Nologo "{0}" {1}') -f $Script:StartupLauncher, $mode)
+    return $(if ($RegistryFallback) { 'fallback' } else { 'task' })
 }
 
 function Get-StartupRunCommand {
-    # HKCU Run is interpreted as a complete CreateProcess command line, so the
-    # executable as well as the script path must be quoted.
+    # HKCU Run is interpreted as a complete CreateProcess command line.
     return ('"{0}" {1}' -f
-        (Get-WindowsScriptHostPath),
+        $Script:StartupLauncher,
         (Get-StartupArguments -RegistryFallback))
 }
 
@@ -240,6 +440,23 @@ function Get-StartupTaskInfo {
         $service = New-Object -ComObject 'Schedule.Service'
         $service.Connect()
         $task = $service.GetFolder('\').GetTask('\' + $Script:StartupTaskName)
+        $action = $task.Definition.Actions.Item(1)
+        $actionPath = [string]$action.Path
+        $actionArguments = [string]$action.Arguments
+        $actionWorkingDirectory = [string]$action.WorkingDirectory
+        $actionMatches = (
+            [string]::Equals(
+                $actionPath,
+                $Script:StartupLauncher,
+                [StringComparison]::OrdinalIgnoreCase) -and
+            [string]::Equals(
+                $actionArguments,
+                (Get-StartupArguments),
+                [StringComparison]::Ordinal) -and
+            [string]::Equals(
+                $actionWorkingDirectory,
+                $Script:InstallRoot,
+                [StringComparison]::OrdinalIgnoreCase))
         $stateNumber = [int]$task.State
         $lastResultUnsigned = [BitConverter]::ToUInt32(
             [BitConverter]::GetBytes([int32]$task.LastTaskResult),
@@ -255,6 +472,9 @@ function Get-StartupTaskInfo {
             Enabled    = [bool]$task.Enabled
             State      = $stateText
             LastResult = ('0x{0:X8}' -f $lastResultUnsigned)
+            ActionPath = $actionPath
+            ActionArguments = $actionArguments
+            ActionMatches = $actionMatches
             Error      = $null
         }
     }
@@ -264,6 +484,9 @@ function Get-StartupTaskInfo {
             Enabled    = $false
             State      = 'Missing'
             LastResult = $null
+            ActionPath = $null
+            ActionArguments = $null
+            ActionMatches = $false
             Error      = $_.Exception.Message
         }
     }
@@ -274,12 +497,6 @@ function Install-StartupLaunchers {
     if (-not (Test-Path -LiteralPath $Script:InstalledScript -PathType Leaf)) {
         throw 'Installed guard script is missing. Run Install again.'
     }
-    $windowsScriptHost = Get-WindowsScriptHostPath
-    if (-not (Test-Path -LiteralPath $windowsScriptHost -PathType Leaf)) {
-        throw ('Consoleless startup requires Windows Script Host, but wscript.exe ' +
-            'was not found: ' + $windowsScriptHost)
-    }
-
     Write-StartupLauncher
 
     $runCommand = Get-StartupRunCommand
@@ -306,6 +523,42 @@ function Install-StartupLaunchers {
     }
     catch {
         $runError = $_.Exception.Message
+    }
+    $staleRunError = $null
+    try {
+        $currentRunValue = $null
+        if (Test-Path -LiteralPath $Script:RunKeyPath) {
+            $currentRunItem = Get-ItemProperty -Path $Script:RunKeyPath `
+                -ErrorAction Stop
+            $currentRunProperty = $currentRunItem.PSObject.Properties[$Script:RunValueName]
+            if ($null -ne $currentRunProperty) {
+                $currentRunValue = [string]$currentRunProperty.Value
+            }
+        }
+        if (($null -ne $currentRunValue) -and
+            [string]::Equals(
+                $currentRunValue,
+                $runCommand,
+                [StringComparison]::Ordinal)) {
+            $runInstalled = $true
+            $runError = $null
+        }
+        else {
+            $runInstalled = $false
+            if ($null -ne $currentRunValue) {
+                Remove-ItemProperty -Path $Script:RunKeyPath `
+                    -Name $Script:RunValueName -Force -ErrorAction Stop
+            }
+            if ($null -eq $runError) {
+                $runError = 'The HKCU Run value was not installed.'
+            }
+        }
+    }
+    catch {
+        $runInstalled = $false
+        $staleRunError = ('An outdated HKCU Run value could not be removed: ' +
+            $_.Exception.Message)
+        $runError = (($runError + ' ' + $staleRunError).Trim())
     }
     if ($null -ne $runError) {
         Write-GuardLog ('HKCU Run startup fallback was unavailable: ' + $runError)
@@ -338,6 +591,7 @@ function Install-StartupLaunchers {
 
     $taskInstalled = $false
     $taskError = $null
+    $staleTaskError = $null
     try {
         # This task uses the current interactive user's token and limited run
         # level.  It neither requests elevation nor stores a password.
@@ -371,7 +625,7 @@ function Install-StartupLaunchers {
         $trigger.Delay = 'PT5S'
 
         $action = $definition.Actions.Create(0) # TASK_ACTION_EXEC
-        $action.Path = Get-WindowsScriptHostPath
+        $action.Path = $Script:StartupLauncher
         $action.Arguments = Get-StartupArguments
         $action.WorkingDirectory = $Script:InstallRoot
 
@@ -395,6 +649,41 @@ function Install-StartupLaunchers {
             $taskError)
     }
 
+    # Verify the registered definition rather than trusting only the COM call's
+    # return value. If a policy prevented replacement, remove this program's
+    # stale legacy action so it cannot keep opening the old script-host chain.
+    $taskInstalled = $false
+    $registeredTask = Get-StartupTaskInfo
+    if ([bool]$registeredTask.Registered -and
+        [bool]$registeredTask.Enabled -and
+        [bool]$registeredTask.ActionMatches) {
+        $taskInstalled = $true
+    }
+    elseif ([bool]$registeredTask.Registered -and
+        [bool]$registeredTask.ActionMatches) {
+        $taskError = 'The scheduled startup task is registered but disabled.'
+    }
+    elseif ([bool]$registeredTask.Registered -and
+        (-not [bool]$registeredTask.ActionMatches)) {
+        $taskInstalled = $false
+        try {
+            $cleanupService = New-Object -ComObject 'Schedule.Service'
+            $cleanupService.Connect()
+            $cleanupService.GetFolder('\').DeleteTask($Script:StartupTaskName, 0)
+            $taskError = (($taskError + ' Existing startup task used an outdated action ' +
+                    'and was removed.').Trim())
+        }
+        catch {
+            $staleTaskError = ('An outdated scheduled startup task could not be removed: ' +
+                $_.Exception.Message)
+            $taskError = (($taskError + ' ' + $staleTaskError).Trim())
+        }
+        Write-GuardLog $taskError
+    }
+    elseif ($null -eq $taskError) {
+        $taskError = [string]$registeredTask.Error
+    }
+
     if ((-not $runUsable) -and (-not $taskInstalled)) {
         throw (('No automatic startup launcher could be installed. HKCU Run: {0} ' +
             'Scheduled task: {1}') -f
@@ -402,6 +691,27 @@ function Install-StartupLaunchers {
                     $approvalError
                 } else { $approvalState }),
             $taskError)
+    }
+
+    # v2.2.1 used a WScript shim.  Once a native startup path is usable, remove
+    # that app-owned shim so any stale legacy registration can no longer start
+    # a visible PowerShell process while the repaired registration takes over.
+    $legacyLauncher = Join-Path $Script:InstallRoot 'phone-input-guard-startup.vbs'
+    try {
+        if (Test-Path -LiteralPath $legacyLauncher -PathType Leaf) {
+            Remove-Item -LiteralPath $legacyLauncher -Force -ErrorAction Stop
+        }
+    }
+    catch {
+        Write-GuardLog ('Could not remove the legacy WScript startup shim: ' +
+            $_.Exception.Message)
+    }
+
+    if ($null -ne $staleRunError) {
+        throw $staleRunError
+    }
+    if ($null -ne $staleTaskError) {
+        throw $staleTaskError
     }
 
     return [pscustomobject]@{
@@ -1753,10 +2063,17 @@ function Start-GuardProcess {
         throw 'Installed guard script is missing. Run Install again.'
     }
     $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    $arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -Sta -File "{0}" Run' -f
+    $arguments = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -Sta -File "{0}" Run' -f
         $Script:InstalledScript
-    return (Start-Process -FilePath $windowsPowerShell -ArgumentList $arguments `
-        -WindowStyle Hidden -PassThru)
+    $startInfo = New-Object Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $windowsPowerShell
+    $startInfo.Arguments = $arguments
+    $startInfo.WorkingDirectory = $Script:InstallRoot
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.WindowStyle = [Diagnostics.ProcessWindowStyle]::Hidden
+    $startInfo.ErrorDialog = $false
+    return [Diagnostics.Process]::Start($startInfo)
 }
 
 function Invoke-StartupSupervisor {
@@ -2520,7 +2837,9 @@ function Show-GuardCheck {
         StartupEntry        = $runEntryStatus
         StartupRunApproval  = Get-RunStartupApproval
         StartupTask         = if ([bool]$startupTask.Registered) {
-            if ([bool]$startupTask.Enabled) { [string]$startupTask.State } else { 'Disabled' }
+            if (-not [bool]$startupTask.ActionMatches) { 'Outdated action' }
+            elseif ([bool]$startupTask.Enabled) { [string]$startupTask.State }
+            else { 'Disabled' }
         }
         else { 'Unavailable or missing' }
         StartupTaskResult   = [string]$startupTask.LastResult
@@ -2564,6 +2883,11 @@ function Uninstall-Guard {
     }
 
     Remove-StartupLaunchers
+
+    if (-not (Wait-StartupLaunchersExit -Seconds 15)) {
+        throw ('Refusing to remove the installation while its native startup ' +
+            'launcher is still stopping. Wait a few seconds and run Uninstall again.')
+    }
 
     if (Test-Path -LiteralPath $Script:InstallRoot) {
         $localRoot = [IO.Path]::GetFullPath($env:LOCALAPPDATA).TrimEnd('\') + '\'
