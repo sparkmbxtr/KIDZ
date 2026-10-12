@@ -51,12 +51,13 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$Script:GuardVersion = '2.2.0'
+$Script:GuardVersion = '2.2.1'
 $Script:NativeMethodsType = $null
 $Script:BleWatcherBridgeType = $null
 $Script:InstallRoot = Join-Path $env:LOCALAPPDATA 'KIDZ'
 $Script:InstalledScript = Join-Path $Script:InstallRoot 'phone-input-guard-windows-ble.ps1'
 $Script:InputHookHelper = Join-Path $Script:InstallRoot 'windows-input-hook-helper.exe'
+$Script:StartupLauncher = Join-Path $Script:InstallRoot 'phone-input-guard-startup.vbs'
 $Script:InputHookHelperSha256 = '0adc71ca80b19003db434b2bff0bf3dc63bb686d180095e67f6478c77d8c2d66'
 $Script:ConfigPath = Join-Path $Script:InstallRoot 'windows-ble-config.json'
 $Script:LogPath = Join-Path $Script:InstallRoot 'windows-ble-guard.log'
@@ -109,28 +110,66 @@ function Write-GuardLog {
     }
 }
 
-function Get-WindowsPowerShellPath {
-    return (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe')
+function Get-WindowsScriptHostPath {
+    return (Join-Path $env:SystemRoot 'System32\wscript.exe')
+}
+
+function Write-StartupLauncher {
+    # wscript.exe has no console window.  It starts the existing PowerShell
+    # supervisor hidden, so neither the scheduled task nor the HKCU fallback
+    # flashes a shell at sign-in.  Deriving the paths at runtime also avoids
+    # embedding a user profile name in this generated file.
+    $launcher = @'
+Option Explicit
+
+Dim shell, fso, installRoot, guardPath, powerShellPath, commandLine, mode, extra, exitCode
+Set shell = CreateObject("WScript.Shell")
+Set fso = CreateObject("Scripting.FileSystemObject")
+
+If WScript.Arguments.Count <> 1 Then WScript.Quit 64
+mode = LCase(CStr(WScript.Arguments.Item(0)))
+Select Case mode
+    Case "task"
+        extra = ""
+    Case "fallback"
+        extra = " -StartupFallback"
+    Case Else
+        WScript.Quit 64
+End Select
+
+installRoot = fso.GetParentFolderName(WScript.ScriptFullName)
+guardPath = fso.BuildPath(installRoot, "phone-input-guard-windows-ble.ps1")
+powerShellPath = shell.ExpandEnvironmentStrings("%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe")
+If Not fso.FileExists(guardPath) Or Not fso.FileExists(powerShellPath) Then WScript.Quit 2
+
+commandLine = QuoteArgument(powerShellPath) & " -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -Sta -File " & QuoteArgument(guardPath) & " Startup" & extra
+exitCode = shell.Run(commandLine, 0, True)
+WScript.Quit exitCode
+
+Function QuoteArgument(ByVal value)
+    QuoteArgument = Chr(34) & value & Chr(34)
+End Function
+'@
+
+    $temporaryPath = $Script:StartupLauncher + '.tmp'
+    $launcher | Set-Content -LiteralPath $temporaryPath -Encoding ASCII
+    Move-Item -LiteralPath $temporaryPath -Destination $Script:StartupLauncher -Force
 }
 
 function Get-StartupArguments {
     param([switch]$RegistryFallback)
 
-    # Task Scheduler stores the executable and its arguments separately.  The
-    # script path is quoted because LocalAppData may contain spaces.
-    $arguments = ('-NoProfile -ExecutionPolicy Bypass ' +
-        '-WindowStyle Hidden -Sta -File "{0}" Startup') -f $Script:InstalledScript
-    if ($RegistryFallback) {
-        $arguments += ' -StartupFallback'
-    }
-    return $arguments
+    # Both startup paths call the consoleless launcher.  //B suppresses WSH
+    # error dialogs and //Nologo keeps the launch completely silent.
+    $mode = if ($RegistryFallback) { 'fallback' } else { 'task' }
+    return (('//B //Nologo "{0}" {1}') -f $Script:StartupLauncher, $mode)
 }
 
 function Get-StartupRunCommand {
     # HKCU Run is interpreted as a complete CreateProcess command line, so the
     # executable as well as the script path must be quoted.
     return ('"{0}" {1}' -f
-        (Get-WindowsPowerShellPath),
+        (Get-WindowsScriptHostPath),
         (Get-StartupArguments -RegistryFallback))
 }
 
@@ -235,6 +274,13 @@ function Install-StartupLaunchers {
     if (-not (Test-Path -LiteralPath $Script:InstalledScript -PathType Leaf)) {
         throw 'Installed guard script is missing. Run Install again.'
     }
+    $windowsScriptHost = Get-WindowsScriptHostPath
+    if (-not (Test-Path -LiteralPath $windowsScriptHost -PathType Leaf)) {
+        throw ('Consoleless startup requires Windows Script Host, but wscript.exe ' +
+            'was not found: ' + $windowsScriptHost)
+    }
+
+    Write-StartupLauncher
 
     $runCommand = Get-StartupRunCommand
     $runInstalled = $false
@@ -325,7 +371,7 @@ function Install-StartupLaunchers {
         $trigger.Delay = 'PT5S'
 
         $action = $definition.Actions.Create(0) # TASK_ACTION_EXEC
-        $action.Path = Get-WindowsPowerShellPath
+        $action.Path = Get-WindowsScriptHostPath
         $action.Arguments = Get-StartupArguments
         $action.WorkingDirectory = $Script:InstallRoot
 

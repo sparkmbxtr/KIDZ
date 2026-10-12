@@ -80,7 +80,18 @@ jobs:
 
           $installed = Join-Path $env:LOCALAPPDATA `
             'KIDZ\phone-input-guard-windows-ble.ps1'
+          $launcher = Join-Path $env:LOCALAPPDATA `
+            'KIDZ\phone-input-guard-startup.vbs'
           & $installed RepairStartup
+
+          if (-not (Test-Path -LiteralPath $launcher -PathType Leaf)) {
+            throw 'RepairStartup did not create the consoleless startup launcher.'
+          }
+          $launcherSource = Get-Content -LiteralPath $launcher -Raw
+          if ($launcherSource -notmatch [regex]::Escape(
+                  'exitCode = shell.Run(commandLine, 0, True)')) {
+            throw 'The startup launcher does not wait for and propagate the supervisor result.'
+          }
 
           $service = New-Object -ComObject 'Schedule.Service'
           $service.Connect()
@@ -90,8 +101,17 @@ jobs:
             throw 'The startup task was registered but is disabled.'
           }
           $action = $task.Definition.Actions.Item(1)
-          if (($action.Path -notlike '*\WindowsPowerShell\v1.0\powershell.exe') -or ($action.Arguments -notmatch '\bStartup\b')) {
-            throw 'The startup task action is not the expected PowerShell Startup command.'
+          $expectedWscript = Join-Path $env:SystemRoot 'System32\wscript.exe'
+          $expectedTaskArguments = '//B //Nologo "{0}" task' -f $launcher
+          if ((-not [string]::Equals(
+                  [string]$action.Path,
+                  $expectedWscript,
+                  [StringComparison]::OrdinalIgnoreCase)) -or
+              (-not [string]::Equals(
+                  [string]$action.Arguments,
+                  $expectedTaskArguments,
+                  [StringComparison]::Ordinal))) {
+            throw 'The startup task action is not the expected consoleless WSH command.'
           }
           if ($task.Definition.Settings.DisallowStartIfOnBatteries -or $task.Definition.Settings.StopIfGoingOnBatteries) {
             throw 'The startup task incorrectly stops or refuses to start on battery power.'
@@ -100,8 +120,34 @@ jobs:
           $runValue = (Get-ItemProperty `
             'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' `
             -Name 'KIDZ Phone Input Guard').'KIDZ Phone Input Guard'
-          if (($runValue -notmatch '\bStartup\b') -or ($runValue -notmatch '-StartupFallback')) {
-            throw 'The HKCU Run fallback is not the expected Startup command.'
+          $expectedRunValue = '"{0}" //B //Nologo "{1}" fallback' -f `
+            $expectedWscript, $launcher
+          if (-not [string]::Equals(
+                  [string]$runValue,
+                  $expectedRunValue,
+                  [StringComparison]::Ordinal)) {
+            throw 'The HKCU Run fallback is not the expected consoleless WSH command.'
+          }
+
+          # Execute the generated launcher while disarmed.  This catches VBS
+          # syntax/quoting regressions without ever allowing input blocking.
+          $startupState = Join-Path $env:LOCALAPPDATA `
+            'KIDZ\windows-ble-startup.json'
+          Remove-Item -LiteralPath $startupState -Force -ErrorAction SilentlyContinue
+          & $expectedWscript '//B' '//Nologo' $launcher 'task'
+          $deadline = [DateTime]::UtcNow.AddSeconds(15)
+          while ((-not (Test-Path -LiteralPath $startupState)) -and
+              ([DateTime]::UtcNow -lt $deadline)) {
+            Start-Sleep -Milliseconds 200
+          }
+          if (-not (Test-Path -LiteralPath $startupState)) {
+            throw 'The consoleless startup launcher did not invoke the supervisor.'
+          }
+          $launcherState = Get-Content -LiteralPath $startupState -Raw |
+            ConvertFrom-Json
+          if ([string]$launcherState.status -ne 'Disarmed') {
+            throw ('The consoleless startup probe returned unexpected status: ' +
+              [string]$launcherState.status)
           }
 
           & $installed Check
