@@ -161,6 +161,8 @@ jobs:
             throw 'RepairStartup needlessly recompiled the valid launcher.'
           }
 
+          . $installed CompileOnly
+
           $service = New-Object -ComObject 'Schedule.Service'
           $service.Connect()
           $root = $service.GetFolder('\')
@@ -206,13 +208,10 @@ jobs:
             throw ('The startup task lacks the exact logon + session-unlock + resume ' +
               'recovery triggers.')
           }
-          $currentUserId = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
           foreach ($trigger in @($logonTriggers[0], $unlockTriggers[0])) {
             if ((-not [bool]$trigger.Enabled) -or
-                (-not [string]::Equals(
-                    [string]$trigger.UserId,
-                    $currentUserId,
-                    [StringComparison]::OrdinalIgnoreCase))) {
+                (-not (Test-StartupTaskUserMatchesCurrentIdentity `
+                    -UserId ([string]$trigger.UserId)))) {
               throw 'A startup recovery trigger is disabled or belongs to another user.'
             }
           }
@@ -234,7 +233,6 @@ jobs:
 
           # Regression for a real lid-close failure: zero active Wi-Fi names
           # must be a valid input, not a terminating parameter-binding error.
-          . $installed CompileOnly
           $runtimeTaskInfo = Get-StartupTaskInfo
           if ((-not [bool]$runtimeTaskInfo.Registered) -or
               (-not [bool]$runtimeTaskInfo.ActionMatches) -or
