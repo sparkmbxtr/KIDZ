@@ -45,13 +45,15 @@ param(
     [ValidateRange(5, 3600)]
     [int]$ObserveSeconds = 60,
 
-    [switch]$StartupFallback
+    [switch]$StartupFallback,
+
+    [switch]$FailClosedStart
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$Script:GuardVersion = '2.2.2'
+$Script:GuardVersion = '2.3.0'
 $Script:NativeMethodsType = $null
 $Script:BleWatcherBridgeType = $null
 $Script:InstallRoot = Join-Path $env:LOCALAPPDATA 'KIDZ'
@@ -65,6 +67,7 @@ $Script:ConfigPath = Join-Path $Script:InstallRoot 'windows-ble-config.json'
 $Script:LogPath = Join-Path $Script:InstallRoot 'windows-ble-guard.log'
 $Script:StatePath = Join-Path $Script:InstallRoot 'windows-ble-state.json'
 $Script:PidPath = Join-Path $Script:InstallRoot 'windows-ble-guard.pid'
+$Script:IdentityPath = Join-Path $Script:InstallRoot 'windows-ble-identity.json'
 $Script:ReadyPath = Join-Path $Script:InstallRoot 'windows-ble-ready.json'
 $Script:StartupStatePath = Join-Path $Script:InstallRoot 'windows-ble-startup.json'
 $Script:ArmedPath = Join-Path $Script:InstallRoot 'windows-ble-armed.flag'
@@ -73,6 +76,8 @@ $Script:RunKeyPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $Script:RunValueName = 'KIDZ Phone Input Guard'
 $Script:RunApprovalKeyPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run'
 $Script:StartupTaskName = 'KIDZ Phone Input Guard Logon'
+$Script:StartupSupervisorMutexName = 'Local\XX-Phone-Input-Guard-Startup-Supervisor-V1'
+$Script:GuardMutexName = 'Local\XX-Phone-Input-Guard-BLE-V2'
 
 function Assert-Windows {
     if ($env:OS -ne 'Windows_NT') {
@@ -204,15 +209,71 @@ function Get-RunningStartupLaunchers {
         })
 }
 
-function Wait-StartupLaunchersExit {
-    param([ValidateRange(1, 30)][int]$Seconds = 10)
+function Test-StartupSupervisorMutexAvailable {
+    $createdNew = $false
+    $mutex = New-Object Threading.Mutex(
+        $false,
+        $Script:StartupSupervisorMutexName,
+        [ref]$createdNew)
+    $acquired = $false
+    try {
+        try {
+            $acquired = $mutex.WaitOne(0)
+        }
+        catch [Threading.AbandonedMutexException] {
+            $acquired = $true
+        }
+        return $acquired
+    }
+    finally {
+        if ($acquired) {
+            try {
+                $mutex.ReleaseMutex()
+            }
+            catch {
+            }
+        }
+        $mutex.Dispose()
+    }
+}
 
-    $deadline = [DateTime]::UtcNow.AddSeconds($Seconds)
-    while ((@(Get-RunningStartupLaunchers).Count -gt 0) -and
-        ([DateTime]::UtcNow -lt $deadline)) {
+function Test-GuardMutexAvailable {
+    $createdNew = $false
+    $mutex = New-Object Threading.Mutex(
+        $false,
+        $Script:GuardMutexName,
+        [ref]$createdNew)
+    $acquired = $false
+    try {
+        try {
+            $acquired = $mutex.WaitOne(0)
+        }
+        catch [Threading.AbandonedMutexException] {
+            $acquired = $true
+        }
+        return $acquired
+    }
+    finally {
+        if ($acquired) {
+            try { $mutex.ReleaseMutex() } catch { }
+        }
+        $mutex.Dispose()
+    }
+}
+
+function Wait-StartupLaunchersExit {
+    param([ValidateRange(1, 60)][int]$Seconds = 10)
+
+    $waitClock = [Diagnostics.Stopwatch]::StartNew()
+    while ($waitClock.ElapsedMilliseconds -lt ([long]$Seconds * 1000)) {
+        if ((@(Get-RunningStartupLaunchers).Count -eq 0) -and
+            (Test-StartupSupervisorMutexAvailable)) {
+            return $true
+        }
         Start-Sleep -Milliseconds 200
     }
-    return (@(Get-RunningStartupLaunchers).Count -eq 0)
+    return ((@(Get-RunningStartupLaunchers).Count -eq 0) -and
+        (Test-StartupSupervisorMutexAvailable))
 }
 
 function Write-StartupLauncher {
@@ -428,6 +489,50 @@ function Get-RunStartupApproval {
     }
 }
 
+function Test-StartupTaskUserMatchesCurrentIdentity {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [string]$UserId
+    )
+
+    if ([string]::IsNullOrWhiteSpace($UserId)) {
+        return $false
+    }
+
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    foreach ($expectedUserId in @(
+            [string]$identity.Name,
+            [string]$identity.User.Value
+        )) {
+        if ((-not [string]::IsNullOrWhiteSpace($expectedUserId)) -and
+            [string]::Equals(
+                $UserId,
+                $expectedUserId,
+                [StringComparison]::OrdinalIgnoreCase)) {
+            return $true
+        }
+    }
+
+    # Task Scheduler can also return an unqualified or otherwise normalized
+    # account name. Resolve that account back to its SID so validation remains
+    # strict without depending on the COM API's chosen string representation.
+    try {
+        $account = New-Object -TypeName Security.Principal.NTAccount `
+            -ArgumentList $UserId
+        $resolvedSid = $account.Translate(
+            [Security.Principal.SecurityIdentifier])
+        return [string]::Equals(
+            [string]$resolvedSid.Value,
+            [string]$identity.User.Value,
+            [StringComparison]::OrdinalIgnoreCase)
+    }
+    catch {
+    }
+    return $false
+}
+
 function Get-StartupTaskInfo {
     $stateNames = @{
         0 = 'Unknown'
@@ -457,6 +562,55 @@ function Get-StartupTaskInfo {
                 $actionWorkingDirectory,
                 $Script:InstallRoot,
                 [StringComparison]::OrdinalIgnoreCase))
+        $triggerCount = [int]$task.Definition.Triggers.Count
+        $hasLogonTrigger = $false
+        $hasUnlockTrigger = $false
+        $hasResumeTrigger = $false
+        for ($triggerIndex = 1; $triggerIndex -le $triggerCount; $triggerIndex++) {
+            $registeredTrigger = $task.Definition.Triggers.Item($triggerIndex)
+            $registeredTriggerType = [int]$registeredTrigger.Type
+            if ($registeredTriggerType -eq 9) {
+                $triggerUserMatches = Test-StartupTaskUserMatchesCurrentIdentity `
+                    -UserId ([string]$registeredTrigger.UserId)
+                if ([bool]$registeredTrigger.Enabled -and
+                    $triggerUserMatches -and
+                    [string]::Equals(
+                        [string]$registeredTrigger.Delay,
+                        'PT5S',
+                        [StringComparison]::OrdinalIgnoreCase)) {
+                    $hasLogonTrigger = $true
+                }
+            }
+            elseif ($registeredTriggerType -eq 11) {
+                $triggerUserMatches = Test-StartupTaskUserMatchesCurrentIdentity `
+                    -UserId ([string]$registeredTrigger.UserId)
+                if (([int]$registeredTrigger.StateChange -eq 8) -and
+                    [bool]$registeredTrigger.Enabled -and
+                    $triggerUserMatches -and
+                    [string]::Equals(
+                        [string]$registeredTrigger.Delay,
+                        'PT2S',
+                        [StringComparison]::OrdinalIgnoreCase)) {
+                    $hasUnlockTrigger = $true
+                }
+            }
+            elseif (($registeredTriggerType -eq 0) -and
+                [bool]$registeredTrigger.Enabled -and
+                [string]::Equals(
+                    [string]$registeredTrigger.Delay,
+                    'PT2S',
+                    [StringComparison]::OrdinalIgnoreCase) -and
+                ([string]$registeredTrigger.Subscription -match
+                    'Microsoft-Windows-Kernel-Power') -and
+                ([string]$registeredTrigger.Subscription -match
+                    'EventID\s*=\s*107') -and
+                ([string]$registeredTrigger.Subscription -match
+                    'EventID\s*=\s*507')) {
+                $hasResumeTrigger = $true
+            }
+        }
+        $triggersMatch = ($triggerCount -eq 3) -and
+            $hasLogonTrigger -and $hasUnlockTrigger -and $hasResumeTrigger
         $stateNumber = [int]$task.State
         $lastResultUnsigned = [BitConverter]::ToUInt32(
             [BitConverter]::GetBytes([int32]$task.LastTaskResult),
@@ -475,6 +629,17 @@ function Get-StartupTaskInfo {
             ActionPath = $actionPath
             ActionArguments = $actionArguments
             ActionMatches = $actionMatches
+            TriggerCount = $triggerCount
+            TriggersMatch = $triggersMatch
+            HasLogonTrigger = $hasLogonTrigger
+            HasUnlockTrigger = $hasUnlockTrigger
+            HasResumeTrigger = $hasResumeTrigger
+            TriggerSummary = $(if ($triggersMatch) {
+                    'Logon + session unlock + system resume'
+                }
+                else {
+                    'Outdated or incomplete'
+                })
             Error      = $null
         }
     }
@@ -487,6 +652,12 @@ function Get-StartupTaskInfo {
             ActionPath = $null
             ActionArguments = $null
             ActionMatches = $false
+            TriggerCount = 0
+            TriggersMatch = $false
+            HasLogonTrigger = $false
+            HasUnlockTrigger = $false
+            HasResumeTrigger = $false
+            TriggerSummary = 'Missing'
             Error      = $_.Exception.Message
         }
     }
@@ -596,13 +767,16 @@ function Install-StartupLaunchers {
         # This task uses the current interactive user's token and limited run
         # level.  It neither requests elevation nor stores a password.
         $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        # Task Scheduler can canonicalize an interactive-token identity to its
+        # account name even when registration supplied a SID. Register with the
+        # canonical account name and accept either form during verification.
         $userId = [string]$identity.Name
         $service = New-Object -ComObject 'Schedule.Service'
         $service.Connect()
         $rootFolder = $service.GetFolder('\')
         $definition = $service.NewTask(0)
         $definition.RegistrationInfo.Description =
-            'Starts the KIDZ BLE input guard for the current user at sign-in.'
+            'Starts the KIDZ BLE input guard at sign-in, unlock, and system resume.'
         $definition.Principal.UserId = $userId
         $definition.Principal.LogonType = 3 # TASK_LOGON_INTERACTIVE_TOKEN
         $definition.Principal.RunLevel = 0 # TASK_RUNLEVEL_LUA (limited)
@@ -623,6 +797,22 @@ function Install-StartupLaunchers {
         $trigger.Enabled = $true
         $trigger.UserId = $userId
         $trigger.Delay = 'PT5S'
+
+        # Re-run the same hidden supervisor after workstation unlock.  This is
+        # the non-admin recovery path when Modern Standby or lid handling ends
+        # both long-lived processes without creating a new logon session.
+        $unlockTrigger = $definition.Triggers.Create(11) # TASK_TRIGGER_SESSION_STATE_CHANGE
+        $unlockTrigger.Enabled = $true
+        $unlockTrigger.UserId = $userId
+        $unlockTrigger.StateChange = 8 # TASK_SESSION_UNLOCK
+        $unlockTrigger.Delay = 'PT2S'
+
+        # Lid resume does not always produce a workstation-unlock event (for
+        # example when Windows is configured not to require sign-in on wake).
+        $resumeTrigger = $definition.Triggers.Create(0) # TASK_TRIGGER_EVENT
+        $resumeTrigger.Enabled = $true
+        $resumeTrigger.Delay = 'PT2S'
+        $resumeTrigger.Subscription = '<QueryList><Query Id="0" Path="System"><Select Path="System">*[System[Provider[@Name="Microsoft-Windows-Kernel-Power"] and (EventID=107 or EventID=507)]]</Select></Query></QueryList>'
 
         $action = $definition.Actions.Create(0) # TASK_ACTION_EXEC
         $action.Path = $Script:StartupLauncher
@@ -656,22 +846,35 @@ function Install-StartupLaunchers {
     $registeredTask = Get-StartupTaskInfo
     if ([bool]$registeredTask.Registered -and
         [bool]$registeredTask.Enabled -and
-        [bool]$registeredTask.ActionMatches) {
+        [bool]$registeredTask.ActionMatches -and
+        [bool]$registeredTask.TriggersMatch) {
         $taskInstalled = $true
     }
     elseif ([bool]$registeredTask.Registered -and
-        [bool]$registeredTask.ActionMatches) {
+        [bool]$registeredTask.ActionMatches -and
+        [bool]$registeredTask.TriggersMatch) {
         $taskError = 'The scheduled startup task is registered but disabled.'
     }
     elseif ([bool]$registeredTask.Registered -and
-        (-not [bool]$registeredTask.ActionMatches)) {
+        ((-not [bool]$registeredTask.ActionMatches) -or
+            (-not [bool]$registeredTask.TriggersMatch))) {
         $taskInstalled = $false
+        $verificationDetail = (
+            'Verification failed: action={0}; triggers={1}; count={2}; ' +
+            'logon={3}; unlock={4}; resume={5}.' -f
+            [bool]$registeredTask.ActionMatches,
+            [bool]$registeredTask.TriggersMatch,
+            [int]$registeredTask.TriggerCount,
+            [bool]$registeredTask.HasLogonTrigger,
+            [bool]$registeredTask.HasUnlockTrigger,
+            [bool]$registeredTask.HasResumeTrigger)
         try {
             $cleanupService = New-Object -ComObject 'Schedule.Service'
             $cleanupService.Connect()
             $cleanupService.GetFolder('\').DeleteTask($Script:StartupTaskName, 0)
-            $taskError = (($taskError + ' Existing startup task used an outdated action ' +
-                    'and was removed.').Trim())
+            $taskError = (($taskError + ' ' + $verificationDetail +
+                    ' Existing startup task used an outdated action or recovery ' +
+                    'trigger and was removed.').Trim())
         }
         catch {
             $staleTaskError = ('An outdated scheduled startup task could not be removed: ' +
@@ -888,6 +1091,9 @@ namespace XXPhoneInputGuardV6
 
         [DllImport("kernel32.dll")]
         private static extern uint GetCurrentThreadId();
+
+        [DllImport("kernel32.dll")]
+        private static extern ulong GetTickCount64();
 
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern uint SetThreadExecutionState(uint executionState);
@@ -1356,6 +1562,11 @@ namespace XXPhoneInputGuardV6
             return SetThreadExecutionState(flags) != 0;
         }
 
+        public static long GetMonotonicMilliseconds()
+        {
+            return unchecked((long)GetTickCount64());
+        }
+
         // 1 = AC connected, 0 = battery, -1 = unavailable or unknown.
         public static int GetACLineStatus()
         {
@@ -1492,25 +1703,43 @@ namespace XXPhoneInputGuardBleV2
 
     public sealed class BleWatcherBridge : IDisposable
     {
-        private readonly object sync = new object();
+        private readonly object lifecycleSync = new object();
+        private readonly object sampleSync = new object();
         private readonly Queue<BleSample> samples = new Queue<BleSample>();
         private readonly Guid targetUuid;
-        private readonly BluetoothLEAdvertisementWatcher watcher;
+        private BluetoothLEAdvertisementWatcher watcher;
+        private BluetoothLEAdvertisementWatcher activeWatcher;
         private int totalPackets;
         private int matchingPackets;
-        private bool disposed;
+        private volatile bool disposed;
 
         public BleWatcherBridge(Guid targetUuid)
         {
             this.targetUuid = targetUuid;
-            watcher = new BluetoothLEAdvertisementWatcher();
-            watcher.ScanningMode = BluetoothLEScanningMode.Active;
-            watcher.Received += OnReceived;
+            watcher = CreateWatcher();
+            activeWatcher = null;
+        }
+
+        private BluetoothLEAdvertisementWatcher CreateWatcher()
+        {
+            BluetoothLEAdvertisementWatcher created =
+                new BluetoothLEAdvertisementWatcher();
+            created.ScanningMode = BluetoothLEScanningMode.Active;
+            created.Received += OnReceived;
+            return created;
         }
 
         public string Status
         {
-            get { return watcher.Status.ToString(); }
+            get
+            {
+                lock (lifecycleSync)
+                {
+                    if (disposed)
+                        throw new ObjectDisposedException("BleWatcherBridge");
+                    return watcher.Status.ToString();
+                }
+            }
         }
 
         public int TotalPackets
@@ -1525,47 +1754,142 @@ namespace XXPhoneInputGuardBleV2
 
         public void Start()
         {
-            if (disposed)
-                throw new ObjectDisposedException("BleWatcherBridge");
-            watcher.Start();
+            lock (lifecycleSync)
+            {
+                if (disposed)
+                    throw new ObjectDisposedException("BleWatcherBridge");
+                watcher.Start();
+                lock (sampleSync)
+                {
+                    samples.Clear();
+                    activeWatcher = watcher;
+                }
+            }
+        }
+
+        public void Restart()
+        {
+            lock (lifecycleSync)
+            {
+                if (disposed)
+                    throw new ObjectDisposedException("BleWatcherBridge");
+
+                BluetoothLEAdvertisementWatcher previous = watcher;
+                try
+                {
+                    previous.Received -= OnReceived;
+                }
+                catch
+                {
+                }
+                lock (sampleSync)
+                {
+                    activeWatcher = null;
+                    samples.Clear();
+                }
+                try
+                {
+                    previous.Stop();
+                }
+                catch
+                {
+                }
+
+                // A new WinRT watcher is intentional.  Windows can
+                // automatically stop the previous scanner during suspend,
+                // and on some adapters its old instance does not resume
+                // delivery even when Status later appears usable.
+                BluetoothLEAdvertisementWatcher replacement = CreateWatcher();
+                watcher = replacement;
+                try
+                {
+                    replacement.Start();
+                    lock (sampleSync)
+                    {
+                        activeWatcher = replacement;
+                    }
+                }
+                catch
+                {
+                    try
+                    {
+                        replacement.Received -= OnReceived;
+                    }
+                    catch
+                    {
+                    }
+                    try
+                    {
+                        replacement.Stop();
+                    }
+                    catch
+                    {
+                    }
+                    lock (sampleSync)
+                    {
+                        activeWatcher = null;
+                        samples.Clear();
+                    }
+                    throw;
+                }
+            }
         }
 
         private void OnReceived(
             BluetoothLEAdvertisementWatcher sender,
             BluetoothLEAdvertisementReceivedEventArgs args)
         {
-            Interlocked.Increment(ref totalPackets);
-            bool isTarget = false;
-            foreach (Guid uuid in args.Advertisement.ServiceUuids)
+            try
             {
-                if (uuid == targetUuid)
+                bool isTarget = false;
+                foreach (Guid uuid in args.Advertisement.ServiceUuids)
                 {
-                    isTarget = true;
-                    break;
+                    if (uuid == targetUuid)
+                    {
+                        isTarget = true;
+                        break;
+                    }
+                }
+
+                BleSample sample = null;
+                if (isTarget)
+                {
+                    // Read all WinRT-projected properties before taking the
+                    // queue lock, so a projection stall cannot block Restart.
+                    sample = new BleSample {
+                        SeenUtc = DateTime.UtcNow,
+                        Address = args.BluetoothAddress,
+                        Rssi = args.RawSignalStrengthInDBm
+                    };
+                }
+
+                lock (sampleSync)
+                {
+                    // A callback already in flight from a replaced watcher
+                    // must not reintroduce a pre-suspend advertisement.
+                    if (disposed || !Object.ReferenceEquals(sender, activeWatcher))
+                        return;
+
+                    Interlocked.Increment(ref totalPackets);
+                    if (!isTarget)
+                        return;
+
+                    Interlocked.Increment(ref matchingPackets);
+                    samples.Enqueue(sample);
+                    while (samples.Count > 1024)
+                        samples.Dequeue();
                 }
             }
-
-            if (!isTarget)
-                return;
-
-            Interlocked.Increment(ref matchingPackets);
-            BleSample sample = new BleSample {
-                SeenUtc = DateTime.UtcNow,
-                Address = args.BluetoothAddress,
-                Rssi = args.RawSignalStrengthInDBm
-            };
-
-            lock (sync)
+            catch
             {
-                samples.Enqueue(sample);
-                while (samples.Count > 1024)
-                    samples.Dequeue();
+                // A transient WinRT projection error must not escape the
+                // native event callback and terminate the guard process.
             }
         }
 
         public BleSample[] Drain()
         {
-            lock (sync)
+            lock (sampleSync)
             {
                 BleSample[] result = samples.ToArray();
                 samples.Clear();
@@ -1575,14 +1899,30 @@ namespace XXPhoneInputGuardBleV2
 
         public void Dispose()
         {
-            if (disposed)
-                return;
+            BluetoothLEAdvertisementWatcher previous;
+            lock (lifecycleSync)
+            {
+                if (disposed)
+                    return;
 
-            disposed = true;
-            watcher.Received -= OnReceived;
+                previous = watcher;
+                try
+                {
+                    previous.Received -= OnReceived;
+                }
+                catch
+                {
+                }
+                lock (sampleSync)
+                {
+                    disposed = true;
+                    activeWatcher = null;
+                    samples.Clear();
+                }
+            }
             try
             {
-                watcher.Stop();
+                previous.Stop();
             }
             catch
             {
@@ -1778,6 +2118,7 @@ function Get-ActiveWifiNames {
 function Get-ExcludedWifiMatch {
     param(
         [Parameter(Mandatory = $true)]$Config,
+        [AllowEmptyCollection()]
         [Parameter(Mandatory = $true)][string[]]$ActiveNames
     )
 
@@ -1877,32 +2218,86 @@ function Get-PresenceText {
 function New-GuardBanner {
     param([Parameter(Mandatory = $true)][string]$Text)
 
-    Add-Type -AssemblyName System.Windows.Forms
-    Add-Type -AssemblyName System.Drawing
+    $form = $null
+    try {
+        Add-Type -AssemblyName System.Windows.Forms
+        Add-Type -AssemblyName System.Drawing
 
-    $form = New-Object System.Windows.Forms.Form
-    $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None
-    $form.ShowInTaskbar = $false
-    $form.TopMost = $true
-    $form.StartPosition = [System.Windows.Forms.FormStartPosition]::Manual
-    $form.BackColor = [System.Drawing.Color]::FromArgb(22, 22, 22)
-    $form.ClientSize = New-Object System.Drawing.Size(236, 30)
-    $form.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::None
+        $form = New-Object System.Windows.Forms.Form
+        $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None
+        $form.ShowInTaskbar = $false
+        $form.TopMost = $true
+        $form.StartPosition = [System.Windows.Forms.FormStartPosition]::Manual
+        $form.BackColor = [System.Drawing.Color]::FromArgb(22, 22, 22)
+        $form.ClientSize = New-Object System.Drawing.Size(236, 30)
+        $form.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::None
 
-    $screen = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
-    $form.Location = New-Object System.Drawing.Point($screen.Left, $screen.Top)
+        $screen = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+        $form.Location = New-Object System.Drawing.Point($screen.Left, $screen.Top)
 
-    $label = New-Object System.Windows.Forms.Label
-    $label.Text = $Text
-    $label.Dock = [System.Windows.Forms.DockStyle]::Fill
-    $label.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
-    $label.ForeColor = [System.Drawing.Color]::White
-    $label.BackColor = $form.BackColor
-    $label.Font = New-Object System.Drawing.Font(
-        'Segoe UI Semibold', 10, [System.Drawing.FontStyle]::Bold,
-        [System.Drawing.GraphicsUnit]::Point)
-    $form.Controls.Add($label)
-    return $form
+        $label = New-Object System.Windows.Forms.Label
+        $label.Text = $Text
+        $label.Dock = [System.Windows.Forms.DockStyle]::Fill
+        $label.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
+        $label.ForeColor = [System.Drawing.Color]::White
+        $label.BackColor = $form.BackColor
+        $label.Font = New-Object System.Drawing.Font(
+            'Segoe UI Semibold', 10, [System.Drawing.FontStyle]::Bold,
+            [System.Drawing.GraphicsUnit]::Point)
+        $form.Controls.Add($label)
+        return $form
+    }
+    catch {
+        Write-GuardLog ('Lock banner is unavailable: ' + $_.Exception.Message)
+        if ($null -ne $form) {
+            try { $form.Dispose() } catch { }
+        }
+        return $null
+    }
+}
+
+function Show-GuardBanner {
+    param([AllowNull()]$Banner)
+
+    if ($null -eq $Banner) {
+        return
+    }
+    try {
+        if (-not $Banner.Visible) {
+            $Banner.Show()
+            $Banner.BringToFront()
+            $Banner.Refresh()
+        }
+    }
+    catch {
+        Write-GuardLog ('Lock banner could not be shown: ' + $_.Exception.Message)
+    }
+}
+
+function Hide-GuardBanner {
+    param([AllowNull()]$Banner)
+
+    if ($null -eq $Banner) {
+        return
+    }
+    try {
+        if ($Banner.Visible) {
+            $Banner.Hide()
+        }
+    }
+    catch {
+        Write-GuardLog ('Lock banner could not be hidden: ' + $_.Exception.Message)
+    }
+}
+
+function Close-GuardBanner {
+    param([AllowNull()]$Banner)
+
+    if ($null -eq $Banner) {
+        return
+    }
+    try { $Banner.Close() } catch { }
+    try { $Banner.Dispose() } catch { }
 }
 
 function Reset-PowerRescueState {
@@ -1977,7 +2372,9 @@ function Write-GuardState {
         [AllowNull()][string]$ExcludedWifi,
         [Parameter(Mandatory = $true)][bool]$InputBlocked,
         [Parameter(Mandatory = $true)][bool]$RescueActive,
-        [Parameter(Mandatory = $true)][string]$WatcherStatus
+        [Parameter(Mandatory = $true)][string]$WatcherStatus,
+        [Parameter(Mandatory = $true)][int]$WatcherRestartCount,
+        [AllowNull()][string]$WatcherRestartReason
     )
 
     try {
@@ -1990,6 +2387,8 @@ function Write-GuardState {
         $state = [pscustomobject][ordered]@{
             updated_utc          = [DateTime]::UtcNow.ToString('o')
             watcher_status       = $WatcherStatus
+            watcher_restart_count = $WatcherRestartCount
+            watcher_restart_reason = $WatcherRestartReason
             phone_state          = Get-PresenceText -State $Presence -NowMilliseconds $NowMilliseconds
             last_rssi_dbm        = $Presence.LastRssi
             last_seen_age_seconds = $age
@@ -2010,16 +2409,149 @@ function Write-GuardState {
     }
 }
 
-function Test-GuardProcess {
+function Write-GuardReadyState {
+    param(
+        [Parameter(Mandatory = $true)][long]$ProcessStartTicks,
+        [Parameter(Mandatory = $true)][string]$WatcherStatus,
+        [Parameter(Mandatory = $true)][int]$WatcherRestartCount,
+        [AllowNull()][string]$WatcherRestartReason,
+        [bool]$Initialized = $true
+    )
+
+    try {
+        $timestamp = [DateTime]::UtcNow.ToString('o')
+        $readyState = [pscustomobject][ordered]@{
+            pid                     = $PID
+            process_start_utc_ticks = $ProcessStartTicks
+            ready_utc               = $timestamp
+            heartbeat_utc           = $timestamp
+            version                 = $Script:GuardVersion
+            initialized             = $Initialized
+            watcher_status          = $WatcherStatus
+            watcher_restart_count   = $WatcherRestartCount
+            watcher_restart_reason  = $WatcherRestartReason
+        }
+        $temporaryReadyPath = $Script:ReadyPath + '.tmp'
+        $readyState | ConvertTo-Json -Depth 2 |
+            Set-Content -LiteralPath $temporaryReadyPath -Encoding UTF8
+        Move-Item -LiteralPath $temporaryReadyPath `
+            -Destination $Script:ReadyPath -Force
+        return $true
+    }
+    catch {
+        Write-GuardLog ('Ready heartbeat write failed: ' + $_.Exception.Message)
+        return $false
+    }
+}
+
+function Write-GuardIdentityState {
+    param([Parameter(Mandatory = $true)][long]$ProcessStartTicks)
+
+    try {
+        $identityState = [pscustomobject][ordered]@{
+            pid                     = $PID
+            process_start_utc_ticks = $ProcessStartTicks
+            created_utc             = [DateTime]::UtcNow.ToString('o')
+            version                 = $Script:GuardVersion
+        }
+        $temporaryIdentityPath = $Script:IdentityPath + '.tmp'
+        $identityState | ConvertTo-Json -Depth 2 |
+            Set-Content -LiteralPath $temporaryIdentityPath -Encoding UTF8
+        Move-Item -LiteralPath $temporaryIdentityPath `
+            -Destination $Script:IdentityPath -Force
+        return $true
+    }
+    catch {
+        Write-GuardLog ('Guard identity write failed: ' + $_.Exception.Message)
+        return $false
+    }
+}
+
+function Get-OwnedGuardProcess {
     if (-not (Test-Path -LiteralPath $Script:PidPath)) {
+        return $null
+    }
+    $process = $null
+    try {
+        $guardPid = [int](Get-Content -LiteralPath $Script:PidPath -Raw)
+        $process = Get-Process -Id $guardPid -ErrorAction Stop
+        # Pin this exact kernel process object before comparing metadata. Any
+        # returned Process therefore remains safe across numeric PID reuse.
+        $null = $process.Handle
+        $actualStartTicks = $process.StartTime.ToUniversalTime().Ticks
+        $owned = $false
+
+        try {
+            if (Test-Path -LiteralPath $Script:IdentityPath) {
+                $identityState = Get-Content -LiteralPath $Script:IdentityPath -Raw |
+                    ConvertFrom-Json
+                $owned = (([int]$identityState.pid -eq $guardPid) -and
+                    ([long]$identityState.process_start_utc_ticks -eq
+                        [long]$actualStartTicks))
+            }
+        }
+        catch {
+            $owned = $false
+        }
+
+        # Version 2.2 did not have the immutable identity file, but its ready
+        # state already carried the same PID/start-time pair for safe upgrade.
+        if ((-not $owned) -and (Test-Path -LiteralPath $Script:ReadyPath)) {
+            try {
+                $readyState = Get-Content -LiteralPath $Script:ReadyPath -Raw |
+                    ConvertFrom-Json
+                $owned = (([int]$readyState.pid -eq $guardPid) -and
+                    ([long]$readyState.process_start_utc_ticks -eq
+                        [long]$actualStartTicks))
+            }
+            catch {
+                $owned = $false
+            }
+        }
+
+        if ($owned) {
+            return $process
+        }
+    }
+    catch {
+    }
+    if ($null -ne $process) {
+        $process.Dispose()
+    }
+    return $null
+}
+
+function Test-GuardProcess {
+    $process = Get-OwnedGuardProcess
+    if ($null -ne $process) {
+        $process.Dispose()
+        return $true
+    }
+    # Missing/corrupt metadata must never be interpreted as a clean stop while
+    # an unknown process still owns the guard mutex.
+    return (-not (Test-GuardMutexAvailable))
+}
+
+function Stop-OwnedGuardProcess {
+    $process = Get-OwnedGuardProcess
+    if ($null -eq $process) {
         return $false
     }
     try {
-        $guardPid = [int](Get-Content -LiteralPath $Script:PidPath -Raw)
-        return ($null -ne (Get-Process -Id $guardPid -ErrorAction Stop))
+        $process.Kill()
+        if (-not $process.WaitForExit(5000)) {
+            return $false
+        }
+        Write-GuardLog ('Force-stopped owned guard PID {0}.' -f $process.Id)
+        return $true
     }
     catch {
+        Write-GuardLog ('Owned guard could not be force-stopped: ' +
+            $_.Exception.Message)
         return $false
+    }
+    finally {
+        $process.Dispose()
     }
 }
 
@@ -2040,21 +2572,290 @@ function Test-GuardReady {
                 [StringComparison]::Ordinal)) {
             return $false
         }
+        $initializedProperty = $readyState.PSObject.Properties['initialized']
+        if (($null -eq $initializedProperty) -or
+            (-not [bool]$initializedProperty.Value)) {
+            return $false
+        }
         $process = Get-Process -Id $guardPid -ErrorAction Stop
         $startProperty = $readyState.PSObject.Properties['process_start_utc_ticks']
         if ($null -eq $startProperty) {
             return $false
         }
         $actualStartTicks = $process.StartTime.ToUniversalTime().Ticks
-        return ([long]$startProperty.Value -eq [long]$actualStartTicks)
+        if ([long]$startProperty.Value -ne [long]$actualStartTicks) {
+            return $false
+        }
+
+        $heartbeatProperty = $readyState.PSObject.Properties['heartbeat_utc']
+        if ($null -eq $heartbeatProperty) {
+            return $false
+        }
+        $heartbeatUtc = [DateTime]::Parse(
+            [string]$heartbeatProperty.Value,
+            [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::AssumeUniversal -bor
+                [Globalization.DateTimeStyles]::AdjustToUniversal)
+        $heartbeatAgeSeconds = ([DateTime]::UtcNow - $heartbeatUtc).TotalSeconds
+        return (($heartbeatAgeSeconds -ge -5) -and ($heartbeatAgeSeconds -le 15))
     }
     catch {
         return $false
     }
 }
 
+function Get-GuardHeartbeatAgeSeconds {
+    try {
+        if (-not (Test-Path -LiteralPath $Script:ReadyPath)) {
+            return $null
+        }
+        $readyState = Get-Content -LiteralPath $Script:ReadyPath -Raw |
+            ConvertFrom-Json
+        $heartbeatProperty = $readyState.PSObject.Properties['heartbeat_utc']
+        if ($null -eq $heartbeatProperty) {
+            return $null
+        }
+        $heartbeatUtc = [DateTime]::Parse(
+            [string]$heartbeatProperty.Value,
+            [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::AssumeUniversal -bor
+                [Globalization.DateTimeStyles]::AdjustToUniversal)
+        return [Math]::Round(
+            ([DateTime]::UtcNow - $heartbeatUtc).TotalSeconds,
+            1)
+    }
+    catch {
+        return $null
+    }
+}
+
+function Get-GuardMetadataSnapshot {
+    $identityPresent = Test-Path -LiteralPath $Script:IdentityPath
+    $identityText = $null
+    if ($identityPresent) {
+        $identityText = Get-Content -LiteralPath $Script:IdentityPath -Raw
+    }
+    $readyPresent = Test-Path -LiteralPath $Script:ReadyPath
+    $readyText = $null
+    if ($readyPresent) {
+        $readyText = Get-Content -LiteralPath $Script:ReadyPath -Raw
+    }
+    return [pscustomobject]@{
+        IdentityPresent = [bool]$identityPresent
+        IdentityText    = $identityText
+        ReadyPresent    = [bool]$readyPresent
+        ReadyText       = $readyText
+    }
+}
+
+function Get-GuardLivenessSnapshot {
+    $process = $null
+    try {
+        $process = Get-OwnedGuardProcess
+        if ($null -eq $process) {
+            return $null
+        }
+        $null = $process.Handle
+        $process.Refresh()
+        if ($process.HasExited) {
+            return $null
+        }
+        $metadata = Get-GuardMetadataSnapshot
+        return [pscustomobject]@{
+            Pid             = [int]$process.Id
+            ProcessStartTicks = [long]$process.StartTime.ToUniversalTime().Ticks
+            IdentityPresent = [bool]$metadata.IdentityPresent
+            IdentityText    = $metadata.IdentityText
+            ReadyPresent    = [bool]$metadata.ReadyPresent
+            ReadyText       = $metadata.ReadyText
+        }
+    }
+    catch {
+        return $null
+    }
+    finally {
+        if ($null -ne $process) {
+            $process.Dispose()
+        }
+    }
+}
+
+function Test-GuardLivenessSnapshotEqual {
+    param(
+        [Parameter(Mandatory = $true)]$Left,
+        [Parameter(Mandatory = $true)]$Right
+    )
+
+    return (([int]$Left.Pid -eq [int]$Right.Pid) -and
+        ([long]$Left.ProcessStartTicks -eq [long]$Right.ProcessStartTicks) -and
+        ([bool]$Left.IdentityPresent -eq [bool]$Right.IdentityPresent) -and
+        ([string]::Equals(
+            [string]$Left.IdentityText,
+            [string]$Right.IdentityText,
+            [StringComparison]::Ordinal)) -and
+        ([bool]$Left.ReadyPresent -eq [bool]$Right.ReadyPresent) -and
+        ([string]::Equals(
+            [string]$Left.ReadyText,
+            [string]$Right.ReadyText,
+            [StringComparison]::Ordinal)))
+}
+
+function Stop-StaleGuardProcess {
+    param(
+        [ValidateRange(15, 300)][int]$MinimumHeartbeatAgeSeconds = 20,
+        $ExpectedSnapshot = $null,
+        [ValidateRange(0, 3600000)][long]$ObservedUnchangedMilliseconds = 0
+    )
+
+    $validatedProcess = $null
+    try {
+        $validatedProcess = Get-OwnedGuardProcess
+        if ($null -eq $validatedProcess) {
+            return $false
+        }
+        $guardPid = [int]$validatedProcess.Id
+        $actualStartTicks = $validatedProcess.StartTime.ToUniversalTime().Ticks
+        $metadata = Get-GuardMetadataSnapshot
+        $currentSnapshot = [pscustomobject]@{
+            Pid               = $guardPid
+            ProcessStartTicks = [long]$actualStartTicks
+            IdentityPresent   = [bool]$metadata.IdentityPresent
+            IdentityText      = $metadata.IdentityText
+            ReadyPresent      = [bool]$metadata.ReadyPresent
+            ReadyText         = $metadata.ReadyText
+        }
+
+        $identityText = $null
+        $readyText = $null
+        $freshnessUtc = $validatedProcess.StartTime.ToUniversalTime()
+        try {
+            if (-not [bool]$metadata.IdentityPresent) {
+                throw 'Guard identity metadata is absent.'
+            }
+            $candidateIdentityText = [string]$metadata.IdentityText
+            $identityState = $candidateIdentityText | ConvertFrom-Json
+            if (([int]$identityState.pid -eq $guardPid) -and
+                ([long]$identityState.process_start_utc_ticks -eq
+                    [long]$actualStartTicks)) {
+                $identityText = $candidateIdentityText
+                $freshnessUtc = [DateTime]::Parse(
+                    [string]$identityState.created_utc,
+                    [Globalization.CultureInfo]::InvariantCulture,
+                    [Globalization.DateTimeStyles]::AssumeUniversal -bor
+                        [Globalization.DateTimeStyles]::AdjustToUniversal)
+            }
+        }
+        catch {
+        }
+
+        try {
+            if (-not [bool]$metadata.ReadyPresent) {
+                throw 'Guard readiness metadata is absent.'
+            }
+            $candidateReadyText = [string]$metadata.ReadyText
+            $readyState = $candidateReadyText | ConvertFrom-Json
+            if (([int]$readyState.pid -eq $guardPid) -and
+                ([long]$readyState.process_start_utc_ticks -eq
+                    [long]$actualStartTicks)) {
+                $readyText = $candidateReadyText
+                $heartbeatProperty = $readyState.PSObject.Properties['heartbeat_utc']
+                $readyProperty = $readyState.PSObject.Properties['ready_utc']
+                $timestampText = if ($null -ne $heartbeatProperty) {
+                    [string]$heartbeatProperty.Value
+                }
+                elseif ($null -ne $readyProperty) {
+                    [string]$readyProperty.Value
+                }
+                else { $null }
+                if (-not [string]::IsNullOrWhiteSpace($timestampText)) {
+                    $freshnessUtc = [DateTime]::Parse(
+                        $timestampText,
+                        [Globalization.CultureInfo]::InvariantCulture,
+                        [Globalization.DateTimeStyles]::AssumeUniversal -bor
+                            [Globalization.DateTimeStyles]::AdjustToUniversal)
+                }
+                else {
+                    $freshnessUtc = (Get-Item -LiteralPath $Script:ReadyPath).LastWriteTimeUtc
+                }
+            }
+        }
+        catch {
+        }
+
+        if (($null -eq $identityText) -and ($null -eq $readyText)) {
+            return $false
+        }
+
+        $heartbeatAgeSeconds = ([DateTime]::UtcNow - $freshnessUtc).TotalSeconds
+        $wallClockStale = ($heartbeatAgeSeconds -ge $MinimumHeartbeatAgeSeconds)
+        $monotonicStale = (($null -ne $ExpectedSnapshot) -and
+            ($ObservedUnchangedMilliseconds -ge
+                ([long]$MinimumHeartbeatAgeSeconds * 1000)) -and
+            (Test-GuardLivenessSnapshotEqual `
+                -Left $ExpectedSnapshot -Right $currentSnapshot))
+
+        # A future timestamp after a wall-clock rollback is not trusted as
+        # either fresh or stale. The supervisor may still authorize recovery
+        # after observing this exact process and exact metadata unchanged for
+        # the full timeout on its monotonic Stopwatch.
+        if ((-not $wallClockStale) -and (-not $monotonicStale)) {
+            return $false
+        }
+
+        $validatedProcess.Refresh()
+        if ($validatedProcess.HasExited -or
+            ([long]$validatedProcess.StartTime.ToUniversalTime().Ticks -ne
+                [long]$actualStartTicks)) {
+            return $false
+        }
+
+        # Any metadata write or presence change since the first read proves
+        # forward progress (or a race), so it cannot authorize termination.
+        $latestMetadata = Get-GuardMetadataSnapshot
+        $latestSnapshot = [pscustomobject]@{
+            Pid               = $guardPid
+            ProcessStartTicks = [long]$actualStartTicks
+            IdentityPresent   = [bool]$latestMetadata.IdentityPresent
+            IdentityText      = $latestMetadata.IdentityText
+            ReadyPresent      = [bool]$latestMetadata.ReadyPresent
+            ReadyText         = $latestMetadata.ReadyText
+        }
+        if (-not (Test-GuardLivenessSnapshotEqual `
+                -Left $currentSnapshot -Right $latestSnapshot)) {
+            return $false
+        }
+
+        # Kill through the already validated Process object instead of doing a
+        # second numeric-PID lookup that could race PID reuse.
+        $validatedProcess.Kill()
+        if (-not $validatedProcess.WaitForExit(5000)) {
+            Write-GuardLog ('Owned guard PID {0} did not confirm exit after Kill.' -f
+                $guardPid)
+            return $false
+        }
+        Write-GuardLog (('Stopped unresponsive guard PID {0}; heartbeat age={1:N1}s; ' +
+                'metadata unchanged={2:N1}s.') -f
+            $guardPid, $heartbeatAgeSeconds,
+            ($ObservedUnchangedMilliseconds / 1000.0))
+        return $true
+    }
+    catch {
+        Write-GuardLog ('Stale guard recovery was not safe to perform: ' +
+            $_.Exception.Message)
+        return $false
+    }
+    finally {
+        if ($null -ne $validatedProcess) {
+            $validatedProcess.Dispose()
+        }
+    }
+}
+
 function Start-GuardProcess {
-    param([switch]$ForceAttempt)
+    param(
+        [switch]$ForceAttempt,
+        [switch]$FailClosed
+    )
 
     if ((-not $ForceAttempt) -and (Test-GuardProcess)) {
         return $null
@@ -2065,9 +2866,63 @@ function Start-GuardProcess {
     $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     $arguments = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -Sta -File "{0}" Run' -f
         $Script:InstalledScript
+    if ($FailClosed) {
+        $arguments += ' -FailClosedStart'
+    }
     $startInfo = New-Object Diagnostics.ProcessStartInfo
     $startInfo.FileName = $windowsPowerShell
     $startInfo.Arguments = $arguments
+    $startInfo.WorkingDirectory = $Script:InstallRoot
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.WindowStyle = [Diagnostics.ProcessWindowStyle]::Hidden
+    $startInfo.ErrorDialog = $false
+    return [Diagnostics.Process]::Start($startInfo)
+}
+
+function Start-StartupSupervisorProcess {
+    if (-not (Test-Path -LiteralPath $Script:StartupLauncher -PathType Leaf)) {
+        throw 'The native startup supervisor launcher is missing. Run RepairStartup.'
+    }
+    if (-not (Test-WindowsGuiExecutable -Path $Script:StartupLauncher)) {
+        throw 'The native startup supervisor launcher is invalid. Run RepairStartup.'
+    }
+
+    # Prefer a demand start through Task Scheduler. Its configured restart
+    # policy then also protects the supervisor launched by Arm. Managed PCs
+    # may forbid per-user tasks, so the same native launcher remains a full
+    # non-admin fallback.
+    $taskInfo = Get-StartupTaskInfo
+    if ([bool]$taskInfo.Registered -and [bool]$taskInfo.Enabled -and
+        [bool]$taskInfo.ActionMatches -and [bool]$taskInfo.TriggersMatch) {
+        try {
+            $service = New-Object -ComObject 'Schedule.Service'
+            $service.Connect()
+            $folder = $service.GetFolder('\')
+            $task = $folder.GetTask('\' + $Script:StartupTaskName)
+            $taskWaitClock = [Diagnostics.Stopwatch]::StartNew()
+            while (([int]$task.State -eq 4) -and
+                ($taskWaitClock.ElapsedMilliseconds -lt 5000)) {
+                Start-Sleep -Milliseconds 250
+                $task = $folder.GetTask('\' + $Script:StartupTaskName)
+            }
+            if ([int]$task.State -ne 4) {
+                $null = $task.Run($null)
+                [void](Write-GuardLog 'Startup supervisor demand-started by Task Scheduler.')
+                return $null
+            }
+            [void](Write-GuardLog ('Scheduled startup task remained Running after its old ' +
+                    'launcher exited; using direct supervisor fallback.'))
+        }
+        catch {
+            [void](Write-GuardLog ('Scheduled supervisor demand start failed; using direct ' +
+                    'fallback. ' + $_.Exception.Message))
+        }
+    }
+
+    $startInfo = New-Object Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $Script:StartupLauncher
+    $startInfo.Arguments = Get-StartupArguments
     $startInfo.WorkingDirectory = $Script:InstallRoot
     $startInfo.UseShellExecute = $false
     $startInfo.CreateNoWindow = $true
@@ -2093,19 +2948,26 @@ function Invoke-StartupSupervisor {
     # takes over without requiring administrator access.
     if ($StartupFallback) {
         Start-Sleep -Seconds 12
-        if (Test-GuardReady) {
+        if ((Test-GuardReady) -and
+            (-not (Test-StartupSupervisorMutexAvailable))) {
             Write-StartupState -Status 'Ready' -Attempt 0 `
                 -Message 'The scheduled startup task started the guard.'
             return
         }
     }
 
-    $createdNew = $false
+    $supervisorMutexOwned = $false
     $supervisorMutex = New-Object Threading.Mutex(
-        $true,
-        'Local\XX-Phone-Input-Guard-Startup-Supervisor-V1',
-        [ref]$createdNew)
-    if (-not $createdNew) {
+        $false,
+        $Script:StartupSupervisorMutexName)
+    try {
+        $supervisorMutexOwned = [bool]$supervisorMutex.WaitOne(0)
+    }
+    catch [Threading.AbandonedMutexException] {
+        $supervisorMutexOwned = $true
+        Write-GuardLog 'Startup supervisor recovered abandoned supervision.'
+    }
+    if (-not $supervisorMutexOwned) {
         if ($StartupFallback) {
             $supervisorMutex.Dispose()
             Write-GuardLog 'A startup supervisor is already running.'
@@ -2118,18 +2980,18 @@ function Invoke-StartupSupervisor {
         while (Test-Path -LiteralPath $Script:ArmedPath) {
             try {
                 if ($supervisorMutex.WaitOne(5000)) {
-                    $createdNew = $true
+                    $supervisorMutexOwned = $true
                     Write-GuardLog 'Scheduled startup task took over supervision.'
                     break
                 }
             }
             catch [Threading.AbandonedMutexException] {
-                $createdNew = $true
+                $supervisorMutexOwned = $true
                 Write-GuardLog 'Scheduled startup task recovered abandoned supervision.'
                 break
             }
         }
-        if (-not $createdNew) {
+        if (-not $supervisorMutexOwned) {
             $supervisorMutex.Dispose()
             return
         }
@@ -2137,9 +2999,44 @@ function Invoke-StartupSupervisor {
 
     $attempt = 0
     $readyReported = $false
+    $healthClock = [Diagnostics.Stopwatch]::StartNew()
+    $lastSupervisorLoopMilliseconds = [long]$healthClock.ElapsedMilliseconds
+    $lastSupervisorLoopUtc = [DateTime]::UtcNow
+    $resumeRecoveryGraceUntilMilliseconds = [long]0
+    $unhealthySnapshot = $null
+    $unhealthySinceMilliseconds = [long]0
+    $unhealthyObservationActive = $false
     try {
         while (Test-Path -LiteralPath $Script:ArmedPath) {
+            $supervisorLoopMilliseconds = [long]$healthClock.ElapsedMilliseconds
+            $supervisorLoopUtc = [DateTime]::UtcNow
+            $supervisorLoopGapMilliseconds = [long][Math]::Max(
+                [Math]::Max(
+                    0,
+                    ($supervisorLoopMilliseconds -
+                        $lastSupervisorLoopMilliseconds)),
+                [Math]::Max(
+                    0,
+                    ($supervisorLoopUtc - $lastSupervisorLoopUtc).TotalMilliseconds))
+            $lastSupervisorLoopMilliseconds = $supervisorLoopMilliseconds
+            $lastSupervisorLoopUtc = $supervisorLoopUtc
+            if ($supervisorLoopGapMilliseconds -ge 5000) {
+                # A pre-suspend unchanged-metadata observation cannot be used
+                # to terminate a guard immediately after wake. Give its own
+                # resume loop a full stale-heartbeat interval to recover.
+                $unhealthySnapshot = $null
+                $unhealthyObservationActive = $false
+                $resumeRecoveryGraceUntilMilliseconds =
+                    $supervisorLoopMilliseconds + 20000
+                Write-GuardLog (('Supervisor detected an execution gap of {0:N1}s; ' +
+                        'resume recovery grace restarted.') -f
+                    ($supervisorLoopGapMilliseconds / 1000.0))
+            }
+
             if (Test-GuardReady) {
+                $unhealthySnapshot = $null
+                $unhealthyObservationActive = $false
+                $resumeRecoveryGraceUntilMilliseconds = [long]0
                 if (-not $readyReported) {
                     Write-StartupState -Status 'Ready' -Attempt $attempt `
                         -Message 'Guard process is ready; supervisor is monitoring it.'
@@ -2150,6 +3047,66 @@ function Invoke-StartupSupervisor {
             }
 
             $readyReported = $false
+            if (Test-GuardProcess) {
+                $healthNow = [long]$healthClock.ElapsedMilliseconds
+                $currentSnapshot = Get-GuardLivenessSnapshot
+                if ($null -eq $currentSnapshot) {
+                    if (-not $unhealthyObservationActive) {
+                        $unhealthyObservationActive = $true
+                        $unhealthySinceMilliseconds = $healthNow
+                        Write-StartupState -Status 'Recovering' -Attempt $attempt `
+                            -Message 'Guard is live but its exact identity is unavailable; waiting safely.'
+                        Write-GuardLog ('Guard heartbeat is stale, but exact process identity ' +
+                            'is unavailable; recovery is waiting safely.')
+                    }
+                    $unhealthySnapshot = $null
+                    Start-Sleep -Seconds 3
+                    continue
+                }
+
+                if ((-not $unhealthyObservationActive) -or
+                    ($null -eq $unhealthySnapshot) -or
+                    (-not (Test-GuardLivenessSnapshotEqual `
+                            -Left $unhealthySnapshot -Right $currentSnapshot))) {
+                    $unhealthyObservationActive = $true
+                    $unhealthySnapshot = $currentSnapshot
+                    $unhealthySinceMilliseconds = $healthNow
+                    Write-StartupState -Status 'Recovering' -Attempt $attempt `
+                        -Message 'Guard heartbeat is stale; allowing brief resume recovery grace.'
+                    Write-GuardLog 'Guard heartbeat became stale; brief recovery grace started.'
+                    Start-Sleep -Seconds 3
+                    continue
+                }
+
+                $observedUnchangedMilliseconds = [long][Math]::Max(
+                    0,
+                    ($healthNow - $unhealthySinceMilliseconds))
+                if ($observedUnchangedMilliseconds -lt 3000) {
+                    Start-Sleep -Seconds 2
+                    continue
+                }
+                if ($healthNow -lt $resumeRecoveryGraceUntilMilliseconds) {
+                    Start-Sleep -Seconds 2
+                    continue
+                }
+                if (Stop-StaleGuardProcess -MinimumHeartbeatAgeSeconds 20 `
+                        -ExpectedSnapshot $unhealthySnapshot `
+                        -ObservedUnchangedMilliseconds $observedUnchangedMilliseconds) {
+                    $unhealthySnapshot = $null
+                    $unhealthyObservationActive = $false
+                    continue
+                }
+                # Never launch a competing child while an exact, still-live
+                # guard identity exists. Recheck until its heartbeat reaches
+                # the safe termination threshold or it recovers.
+                Start-Sleep -Seconds 2
+                continue
+            }
+            else {
+                $unhealthySnapshot = $null
+                $unhealthyObservationActive = $false
+            }
+
             $attempt++
             Write-StartupState -Status 'Starting' -Attempt $attempt `
                 -Message 'Launching the hidden guard process.'
@@ -2158,7 +3115,10 @@ function Invoke-StartupSupervisor {
             # Ignore an unverified stale PID file.  The guard's named mutex
             # prevents duplicate active monitors if another process is real.
             try {
-                $child = Start-GuardProcess -ForceAttempt
+                $child = Start-GuardProcess -ForceAttempt -FailClosed
+                # Hold the exact kernel process identity for timeout handling;
+                # never re-resolve this child by numeric PID.
+                $null = $child.Handle
             }
             catch {
                 $detail = 'Guard process could not be launched: ' + $_.Exception.Message
@@ -2168,9 +3128,9 @@ function Invoke-StartupSupervisor {
                 Start-Sleep -Seconds ([Math]::Min(30, 4 + ($attempt * 2)))
                 continue
             }
-            $deadline = [DateTime]::UtcNow.AddSeconds(45)
+            $initializationClock = [Diagnostics.Stopwatch]::StartNew()
             while ((Test-Path -LiteralPath $Script:ArmedPath) -and
-                [DateTime]::UtcNow -lt $deadline) {
+                ($initializationClock.ElapsedMilliseconds -lt 45000)) {
                 if (Test-GuardReady) {
                     break
                 }
@@ -2188,31 +3148,68 @@ function Invoke-StartupSupervisor {
 
             if (Test-GuardReady) {
                 Write-GuardLog ('Startup launch attempt {0} became ready.' -f $attempt)
+                $child.Dispose()
                 continue
             }
             if (-not (Test-Path -LiteralPath $Script:ArmedPath)) {
+                # The child may already hold the native blocker but may not
+                # yet have published readiness. Stop this exact cached process
+                # before returning from a disarm request.
+                try {
+                    $child.Refresh()
+                    if (-not $child.HasExited) {
+                        $child.Kill()
+                        if (-not $child.WaitForExit(5000)) {
+                            Write-GuardLog ('Disarm could not confirm exit of the ' +
+                                'initializing guard child.')
+                        }
+                    }
+                }
+                catch {
+                    Write-GuardLog ('Disarm cleanup of the initializing guard child ' +
+                        'reported: ' + $_.Exception.Message)
+                }
+                $child.Dispose()
                 break
             }
 
             $detail = 'Guard exited before its readiness handshake.'
+            $childExitConfirmed = $false
             try {
                 $child.Refresh()
                 if (-not $child.HasExited) {
-                    # This exact child has not reached the readiness point in
-                    # 45 seconds.  It cannot yet have started input blocking.
-                    Stop-Process -Id $child.Id -Force -ErrorAction Stop
-                    $detail = 'Guard initialization timed out and was stopped.'
+                    # A fail-closed child can already be blocking input. Kill
+                    # the exact cached process so its safety job closes too.
+                    $child.Kill()
+                    if ($child.WaitForExit(5000)) {
+                        $detail = 'Guard initialization timed out and was stopped.'
+                        $childExitConfirmed = $true
+                    }
+                    else {
+                        $detail = 'Guard initialization timed out; exit was not confirmed.'
+                    }
                 }
                 else {
                     $detail += ' Exit code=' + [string]$child.ExitCode + '.'
+                    $childExitConfirmed = $true
                 }
             }
             catch {
                 $detail += ' ' + $_.Exception.Message
             }
+            $child.Dispose()
             Write-StartupState -Status 'Retrying' -Attempt $attempt -Message $detail
             Write-GuardLog ('Startup launch attempt {0} failed: {1}' -f $attempt, $detail)
-            Start-Sleep -Seconds ([Math]::Min(30, 4 + ($attempt * 2)))
+            if ($childExitConfirmed) {
+                # Every child that reached initialization may already have
+                # held the fail-closed blocker. Retry promptly after its exact
+                # exit, with a floor that avoids a hot process-spawn loop on a
+                # persistent pre-block initialization failure.
+                Start-Sleep -Seconds 1
+            }
+            else {
+                Start-Sleep -Seconds ([Math]::Min(30, 4 + ($attempt * 2)))
+            }
         }
 
         Write-StartupState -Status 'Disarmed' -Attempt $attempt `
@@ -2220,7 +3217,9 @@ function Invoke-StartupSupervisor {
         Write-GuardLog 'Startup supervisor stopped because the guard was disarmed.'
     }
     finally {
-        $supervisorMutex.ReleaseMutex()
+        if ($supervisorMutexOwned) {
+            $supervisorMutex.ReleaseMutex()
+        }
         $supervisorMutex.Dispose()
     }
 }
@@ -2237,8 +3236,8 @@ function Test-BleNearNow {
     $bestRssi = -127
     try {
         $bridge.Start()
-        $finish = [DateTime]::UtcNow.AddSeconds($Seconds)
-        while ([DateTime]::UtcNow -lt $finish) {
+        $scanClock = [Diagnostics.Stopwatch]::StartNew()
+        while ($scanClock.ElapsedMilliseconds -lt ([long]$Seconds * 1000)) {
             foreach ($sample in @($bridge.Drain())) {
                 $rssi = [int]$sample.Rssi
                 if ($rssi -gt $bestRssi) {
@@ -2315,7 +3314,6 @@ function Invoke-Observe {
 function Invoke-GuardLoop {
     Assert-Windows
     Initialize-NativeMethods
-    Initialize-BleWatcherBridge
     Assert-InputHookHelper -Path $Script:InputHookHelper
     $nativeMethods = $Script:NativeMethodsType
 
@@ -2323,9 +3321,18 @@ function Invoke-GuardLoop {
         return
     }
 
-    $createdNew = $false
-    $mutex = New-Object Threading.Mutex($true, 'Local\XX-Phone-Input-Guard-BLE-V2', [ref]$createdNew)
-    if (-not $createdNew) {
+    $guardMutexOwned = $false
+    $mutex = New-Object Threading.Mutex(
+        $false,
+        $Script:GuardMutexName)
+    try {
+        $guardMutexOwned = [bool]$mutex.WaitOne(0)
+    }
+    catch [Threading.AbandonedMutexException] {
+        # WaitOne grants ownership when it reports abandonment.
+        $guardMutexOwned = $true
+    }
+    if (-not $guardMutexOwned) {
         $mutex.Dispose()
         return
     }
@@ -2334,58 +3341,291 @@ function Invoke-GuardLoop {
     Remove-Item -LiteralPath $Script:ReadyPath -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath ($Script:ReadyPath + '.tmp') -Force -ErrorAction SilentlyContinue
 
-    $config = Get-GuardConfig
-    $guid = ConvertTo-TargetGuid -Value ([string]$config.service_uuid)
-    $bridge = New-BleWatcherBridge -TargetUuid $guid
-    $banner = New-GuardBanner -Text ([string]$config.banner_text)
+    $config = $null
+    $bridge = $null
+    $banner = $null
     $clock = [Diagnostics.Stopwatch]::StartNew()
-    $presence = New-PresenceState
-    $initialAC = $nativeMethods::GetACLineStatus()
-    $powerState = @{
-        StableAC       = $initialAC
-        CandidateAC    = $initialAC
-        CandidateSince = [long]0
-        SawDisconnect  = $false
-        ReconnectTimes = @()
-    }
+    $presence = $null
+    $powerState = $null
     $activeWifi = @()
     $excludedWifi = $null
     $nextWifiPoll = [long]0
     $nextStateWrite = [long]0
+    $nextWatcherHealthCheck = [long]0
+    $nextWatcherRestartAttempt = [long]0
+    $pendingWatcherRecoveryReason = $null
+    $watcherRecoveryEpisodeActive = $false
+    $watcherRestartCount = 0
+    $lastWatcherRestartReason = $null
+    $watcherStatus = 'Initializing'
+    $lastLoopUtc = [DateTime]::UtcNow
+    $lastLoopMonotonicMilliseconds = [long]$nativeMethods::GetMonotonicMilliseconds()
     $lastBlockAssert = [long]-10000
     $lastBlockFailureLog = [long]-10000
     $lastReleaseFailureLog = [long]-10000
     $inputBlocked = $false
     $rescueActive = $false
     $lastEffectiveBlock = $null
-    $PID | Set-Content -LiteralPath $Script:PidPath -Encoding ASCII
     Remove-Item -LiteralPath $Script:StopPath -Force -ErrorAction SilentlyContinue
 
-    Write-GuardLog ('BLE guard {0} started. UUID={1}; lock={2}; unlock={3}; absence={4}s.' -f
-        $Script:GuardVersion, $config.service_uuid, $config.lock_rssi_dbm,
-        $config.unlock_rssi_dbm, $config.absence_seconds)
-
     try {
-        $bridge.Start()
         $currentProcess = Get-Process -Id $PID -ErrorAction Stop
         $processStartTicks = $currentProcess.StartTime.ToUniversalTime().Ticks
-        $readyState = [pscustomobject][ordered]@{
-            pid                     = $PID
-            process_start_utc_ticks = $processStartTicks
-            ready_utc               = [DateTime]::UtcNow.ToString('o')
-            version                 = $Script:GuardVersion
+
+        # Establish an exact, recoverable process identity before this child
+        # can block input. Disarm and the supervisor can then always stop the
+        # correct process even if later initialization hangs.
+        if (-not (Write-GuardIdentityState -ProcessStartTicks $processStartTicks)) {
+            throw 'The guard could not create its immutable process identity.'
         }
-        $temporaryReadyPath = $Script:ReadyPath + '.tmp'
-        $readyState | ConvertTo-Json -Depth 2 |
-            Set-Content -LiteralPath $temporaryReadyPath -Encoding UTF8
-        Move-Item -LiteralPath $temporaryReadyPath `
-            -Destination $Script:ReadyPath -Force
+        $PID | Set-Content -LiteralPath $Script:PidPath -Encoding ASCII
+
+        # Every armed Run is fail-closed. FailClosedStart remains accepted for
+        # compatibility with existing launchers, but safety must not depend on
+        # a caller remembering the switch.
+        $blockedNow = $nativeMethods::StartInputBlocker(
+            $Script:InputHookHelper)
+        if ($blockedNow) {
+            $inputBlocked = $true
+        }
+        else {
+            $blockFailure = (('Native input helper failed during fail-closed ' +
+                    'startup while {0}; error {1}.') -f
+                $nativeMethods::GetBlockerStage(),
+                $nativeMethods::GetBlockerError())
+            Write-GuardLog $blockFailure
+            $null = $nativeMethods::StopInputBlocker()
+            throw ($blockFailure + ' Refusing to report the guard ready.')
+        }
+        $lastBlockAssert = [long]$clock.ElapsedMilliseconds
+        if ($inputBlocked) {
+            Show-GuardBanner -Banner $banner
+        }
+        $null = $nativeMethods::SetKeepAwake($true)
+
+        if (-not (Write-GuardReadyState -ProcessStartTicks $processStartTicks `
+                -WatcherStatus $watcherStatus `
+                -WatcherRestartCount $watcherRestartCount `
+                -WatcherRestartReason $lastWatcherRestartReason `
+                -Initialized $false)) {
+            throw 'The guard could not create its initialization heartbeat.'
+        }
+
+        Initialize-BleWatcherBridge
+        $config = Get-GuardConfig
+        $guid = ConvertTo-TargetGuid -Value ([string]$config.service_uuid)
+        $bridge = New-BleWatcherBridge -TargetUuid $guid
+        $banner = New-GuardBanner -Text ([string]$config.banner_text)
+        $presence = New-PresenceState
+        $presence.Near = $false
+        $presence.Reason = 'fail-closed startup'
+        $initialAC = $nativeMethods::GetACLineStatus()
+        $powerState = @{
+            StableAC       = $initialAC
+            CandidateAC    = $initialAC
+            CandidateSince = [long]0
+            SawDisconnect  = $false
+            ReconnectTimes = @()
+        }
+
+        Write-GuardLog ('BLE guard {0} started. UUID={1}; lock={2}; unlock={3}; absence={4}s.' -f
+            $Script:GuardVersion, $config.service_uuid, $config.lock_rssi_dbm,
+            $config.unlock_rssi_dbm, $config.absence_seconds)
+
+        try {
+            $bridge.Start()
+            $watcherStatus = [string]$bridge.Status
+        }
+        catch {
+            # A radio/WinRT startup failure is a recoverable FAR state. Keep
+            # this process alive so charger rescue remains available while the
+            # normal watcher-restart loop repairs Bluetooth.
+            $watcherStatus = 'Error'
+            $pendingWatcherRecoveryReason = 'initial watcher start error: ' +
+                $_.Exception.Message
+            $lastWatcherRestartReason = $pendingWatcherRecoveryReason
+            $watcherRecoveryEpisodeActive = $true
+            $presence.Near = $false
+            $presence.Reason = 'BLE watcher recovering'
+            $presence.RecentRssi.Clear()
+            if (-not $inputBlocked) {
+                $blockedNow = $nativeMethods::StartInputBlocker(
+                    $Script:InputHookHelper)
+                if ($blockedNow) {
+                    $inputBlocked = $true
+                }
+                else {
+                    $blockFailure = (('Native input helper failed after BLE startup ' +
+                            'error while {0}; error {1}.') -f
+                        $nativeMethods::GetBlockerStage(),
+                        $nativeMethods::GetBlockerError())
+                    Write-GuardLog $blockFailure
+                    $null = $nativeMethods::StopInputBlocker()
+                    throw ($blockFailure + ' Restarting the supervised guard.')
+                }
+                $lastBlockAssert = [long]$clock.ElapsedMilliseconds
+            }
+            if ($inputBlocked) {
+                Show-GuardBanner -Banner $banner
+            }
+            $null = $nativeMethods::SetKeepAwake($true)
+            Write-GuardLog $pendingWatcherRecoveryReason
+        }
+        if (-not (Write-GuardReadyState -ProcessStartTicks $processStartTicks `
+                -WatcherStatus $watcherStatus `
+                -WatcherRestartCount $watcherRestartCount `
+                -WatcherRestartReason $lastWatcherRestartReason)) {
+            throw 'The guard could not create its readiness heartbeat.'
+        }
         while ((Test-Path -LiteralPath $Script:ArmedPath) -and
             -not (Test-Path -LiteralPath $Script:StopPath)) {
             $now = [long]$clock.ElapsedMilliseconds
-            foreach ($sample in @($bridge.Drain())) {
-                Add-PresenceSample -State $presence -Config $config `
-                    -Rssi ([int]$sample.Rssi) -NowMilliseconds $now
+            $loopUtc = [DateTime]::UtcNow
+            $loopMonotonicMilliseconds = [long]$nativeMethods::GetMonotonicMilliseconds()
+            $utcLoopGapMilliseconds = [long][Math]::Max(
+                0,
+                ($loopUtc - $lastLoopUtc).TotalMilliseconds)
+            $monotonicLoopGapMilliseconds = [long][Math]::Max(
+                0,
+                ($loopMonotonicMilliseconds - $lastLoopMonotonicMilliseconds))
+            $loopGapMilliseconds = [long][Math]::Max(
+                $utcLoopGapMilliseconds,
+                $monotonicLoopGapMilliseconds)
+            $lastLoopUtc = $loopUtc
+            $lastLoopMonotonicMilliseconds = $loopMonotonicMilliseconds
+
+            # WinRT automatically stops BLE advertisement watchers when an app
+            # is suspended.  Recreate the watcher after a long execution gap
+            # even if an adapter incorrectly continues to report Started.
+            $watcherRecoveryReason = $null
+            $resumeGapDetected = $false
+            if ($loopGapMilliseconds -ge 5000) {
+                $resumeGapDetected = $true
+                $watcherRecoveryReason = ('execution gap of {0:N1} seconds' -f
+                    ($loopGapMilliseconds / 1000.0))
+            }
+
+            if (($null -eq $watcherRecoveryReason) -and
+                ($now -ge $nextWatcherHealthCheck)) {
+                try {
+                    $watcherStatus = [string]$bridge.Status
+                    if (-not [string]::Equals(
+                            $watcherStatus,
+                            'Started',
+                            [StringComparison]::OrdinalIgnoreCase)) {
+                        $watcherRecoveryReason = 'watcher status ' + $watcherStatus
+                    }
+                }
+                catch {
+                    $watcherStatus = 'Error'
+                    $watcherRecoveryReason = 'watcher status error: ' +
+                        $_.Exception.Message
+                }
+                $nextWatcherHealthCheck = $now + 1000
+            }
+
+            $recoveryJustStarted = $false
+            if ($null -ne $watcherRecoveryReason) {
+                # Every suspend/resume gap is a new trust boundary even if a
+                # previous watcher-recovery attempt was already pending.
+                $recoveryJustStarted = (($null -eq $pendingWatcherRecoveryReason) -or
+                    $resumeGapDetected)
+                $pendingWatcherRecoveryReason = $watcherRecoveryReason
+            }
+
+            if ($null -ne $pendingWatcherRecoveryReason) {
+                # Until a fresh strong advertisement arrives, an interrupted
+                # scanner must not leave the previous NEAR decision trusted.
+                $presence.Near = $false
+                $presence.Reason = 'BLE watcher recovering'
+                $presence.RecentRssi.Clear()
+            }
+
+            if ($recoveryJustStarted) {
+                if (-not $watcherRecoveryEpisodeActive) {
+                    # Discard charger edges from before suspend once, but keep
+                    # all new edges across slow or repeated BLE restart attempts.
+                    Reset-PowerRescueState -State $powerState -NowMilliseconds $now
+                    $watcherRecoveryEpisodeActive = $true
+                }
+
+                # Stale pre-suspend network state cannot be used as an
+                # exclusion. Assert the blocker before any WinRT restart or
+                # Wi-Fi query can stall; a fresh strong advertisement or a
+                # freshly detected exclusion Wi-Fi will release it below.
+                $activeWifi = @()
+                $excludedWifi = $null
+                $nextWifiPoll = [long]0
+                if (-not $rescueActive) {
+                    # Revalidate the already job-contained helper
+                    # unconditionally. If it exited during suspend, this call
+                    # starts a replacement and confirms it remains running.
+                    $blockedNow = $nativeMethods::StartInputBlocker(
+                        $Script:InputHookHelper)
+                    if ($blockedNow) {
+                        $inputBlocked = $true
+                    }
+                    else {
+                        $blockFailure = (('Native input helper failed during BLE ' +
+                                'recovery while {0}; error {1}.') -f
+                            $nativeMethods::GetBlockerStage(),
+                            $nativeMethods::GetBlockerError())
+                        if (($now - $lastBlockFailureLog) -ge 5000) {
+                            Write-GuardLog $blockFailure
+                            $lastBlockFailureLog = $now
+                        }
+                        $null = $nativeMethods::StopInputBlocker()
+                        throw ($blockFailure + ' Restarting the supervised guard.')
+                    }
+                    $lastBlockAssert = $now
+                    if ($inputBlocked) {
+                        Show-GuardBanner -Banner $banner
+                    }
+                    $null = $nativeMethods::SetKeepAwake($true)
+                }
+
+                # Publish fail-closed progress before any WinRT restart or
+                # network probe. A pre-sleep heartbeat may already be stale;
+                # without this write the supervisor could kill a healthy
+                # recovery iteration and briefly release the helper job.
+                $watcherStatus = 'Recovering'
+                [void](Write-GuardReadyState `
+                    -ProcessStartTicks $processStartTicks `
+                    -WatcherStatus $watcherStatus `
+                    -WatcherRestartCount $watcherRestartCount `
+                    -WatcherRestartReason $pendingWatcherRecoveryReason)
+            }
+
+            if (($null -ne $pendingWatcherRecoveryReason) -and
+                ($now -ge $nextWatcherRestartAttempt)) {
+                $restartReason = [string]$pendingWatcherRecoveryReason
+                try {
+                    $bridge.Restart()
+                    $watcherStatus = [string]$bridge.Status
+                    $watcherRestartCount++
+                    $lastWatcherRestartReason = $restartReason
+                    Write-GuardLog ('BLE watcher recovery {0}: {1}; status={2}.' -f
+                        $watcherRestartCount,
+                        $restartReason,
+                        $watcherStatus)
+                    $nextWatcherRestartAttempt = $now + 5000
+                    $pendingWatcherRecoveryReason = $null
+                }
+                catch {
+                    $watcherStatus = 'Error'
+                    $lastWatcherRestartReason = $restartReason
+                    Write-GuardLog ('BLE watcher recovery failed: {0}' -f
+                        $_.Exception.Message)
+                    $nextWatcherRestartAttempt = $now + 5000
+                }
+            }
+
+            $drainedSamples = @($bridge.Drain())
+            if ($null -eq $pendingWatcherRecoveryReason) {
+                foreach ($sample in $drainedSamples) {
+                    Add-PresenceSample -State $presence -Config $config `
+                        -Rssi ([int]$sample.Rssi) -NowMilliseconds $now
+                }
             }
             Update-PresenceTimeout -State $presence -Config $config -NowMilliseconds $now
 
@@ -2393,6 +3633,12 @@ function Invoke-GuardLoop {
                 $activeWifi = @(Get-ActiveWifiNames)
                 $excludedWifi = Get-ExcludedWifiMatch -Config $config -ActiveNames $activeWifi
                 $nextWifiPoll = $now + [long]$config.wifi_poll_milliseconds
+            }
+
+            if ($watcherRecoveryEpisodeActive -and
+                ((($null -ne $presence.Near) -and [bool]$presence.Near) -or
+                    ($null -ne $excludedWifi))) {
+                $watcherRecoveryEpisodeActive = $false
             }
 
             $learning = ($null -eq $presence.Near)
@@ -2437,13 +3683,11 @@ function Invoke-GuardLoop {
                     }
                     $lastBlockAssert = $now
                 }
-                if ($inputBlocked -and -not $banner.Visible) {
-                    $banner.Show()
-                    $banner.BringToFront()
-                    $banner.Refresh()
+                if ($inputBlocked) {
+                    Show-GuardBanner -Banner $banner
                 }
-                elseif ((-not $inputBlocked) -and $banner.Visible) {
-                    $banner.Hide()
+                else {
+                    Hide-GuardBanner -Banner $banner
                 }
                 $null = $nativeMethods::SetKeepAwake($true)
             }
@@ -2462,17 +3706,11 @@ function Invoke-GuardLoop {
                 }
 
                 if ($inputBlocked) {
-                    if (-not $banner.Visible) {
-                        $banner.Show()
-                        $banner.BringToFront()
-                        $banner.Refresh()
-                    }
+                    Show-GuardBanner -Banner $banner
                     $null = $nativeMethods::SetKeepAwake($true)
                 }
                 else {
-                    if ($banner.Visible) {
-                        $banner.Hide()
-                    }
+                    Hide-GuardBanner -Banner $banner
                     $null = $nativeMethods::SetKeepAwake($false)
                 }
             }
@@ -2501,11 +3739,28 @@ function Invoke-GuardLoop {
             if ($now -ge $nextStateWrite) {
                 Write-GuardState -Config $config -Presence $presence -NowMilliseconds $now `
                     -ExcludedWifi $excludedWifi -InputBlocked $inputBlocked `
-                    -RescueActive $rescueActive -WatcherStatus $bridge.Status
+                    -RescueActive $rescueActive -WatcherStatus $watcherStatus `
+                    -WatcherRestartCount $watcherRestartCount `
+                    -WatcherRestartReason $lastWatcherRestartReason
+                [void](Write-GuardReadyState `
+                    -ProcessStartTicks $processStartTicks `
+                    -WatcherStatus $watcherStatus `
+                    -WatcherRestartCount $watcherRestartCount `
+                    -WatcherRestartReason $lastWatcherRestartReason)
                 $nextStateWrite = $now + 1000
             }
 
-            [System.Windows.Forms.Application]::DoEvents()
+            if ($null -ne $banner) {
+                try {
+                    [System.Windows.Forms.Application]::DoEvents()
+                }
+                catch {
+                    Write-GuardLog ('Lock banner event pump was disabled: ' +
+                        $_.Exception.Message)
+                    Close-GuardBanner -Banner $banner
+                    $banner = $null
+                }
+            }
             [Threading.Thread]::Sleep([int]$config.poll_milliseconds)
         }
     }
@@ -2516,10 +3771,7 @@ function Invoke-GuardLoop {
     finally {
         $releaseConfirmed = [bool]$nativeMethods::StopInputBlocker()
         $null = $nativeMethods::SetKeepAwake($false)
-        if ($null -ne $banner) {
-            $banner.Close()
-            $banner.Dispose()
-        }
+        Close-GuardBanner -Banner $banner
         if ($null -ne $bridge) {
             $bridge.Dispose()
         }
@@ -2528,13 +3780,23 @@ function Invoke-GuardLoop {
                 ([int](Get-Content -LiteralPath $Script:PidPath -Raw) -eq $PID)) {
                 Remove-Item -LiteralPath $Script:PidPath -Force
             }
+            if (Test-Path -LiteralPath $Script:IdentityPath) {
+                $ownedIdentity = Get-Content -LiteralPath $Script:IdentityPath -Raw |
+                    ConvertFrom-Json
+                if ([int]$ownedIdentity.pid -eq $PID) {
+                    Remove-Item -LiteralPath $Script:IdentityPath -Force
+                }
+            }
         }
         catch {
         }
         Remove-Item -LiteralPath $Script:StopPath -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $Script:ReadyPath -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath ($Script:ReadyPath + '.tmp') -Force -ErrorAction SilentlyContinue
-        $mutex.ReleaseMutex()
+        Remove-Item -LiteralPath ($Script:IdentityPath + '.tmp') -Force -ErrorAction SilentlyContinue
+        if ($guardMutexOwned) {
+            $mutex.ReleaseMutex()
+        }
         $mutex.Dispose()
         if ($releaseConfirmed) {
             Write-GuardLog 'Guard stopped; input release confirmed.'
@@ -2663,29 +3925,64 @@ function Arm-Guard {
     Initialize-NativeMethods
     $config = Get-GuardConfig
     $null = Install-StartupLaunchers
-    $activeWifi = @(Get-ActiveWifiNames)
-    $excludedWifi = Get-ExcludedWifiMatch -Config $config -ActiveNames $activeWifi
 
     if ((Test-Path -LiteralPath $Script:ArmedPath) -and (Test-GuardReady)) {
+        if (Test-StartupSupervisorMutexAvailable) {
+            $null = Start-StartupSupervisorProcess
+            $supervisorWaitClock = [Diagnostics.Stopwatch]::StartNew()
+            while ((Test-StartupSupervisorMutexAvailable) -and
+                ($supervisorWaitClock.ElapsedMilliseconds -lt 10000)) {
+                Start-Sleep -Milliseconds 200
+            }
+            if (Test-StartupSupervisorMutexAvailable) {
+                throw ('The guard is ready, but its startup supervisor could not be ' +
+                    'restored. Run RepairStartup, then retry Arm.')
+            }
+        }
         Write-Host 'BLE Phone Input Guard is already armed and ready.' -ForegroundColor Green
         return
     }
 
-    # Do not race a stale or partially initialized hidden process.  Stop it
+    # A failed or interrupted previous run can leave the armed marker behind.
+    # Clear it before preflight so a failed Arm never reports Armed=True while
+    # no process exists, and so any old supervisor exits before replacement.
+    Remove-Item -LiteralPath $Script:ArmedPath -Force -ErrorAction SilentlyContinue
+
+    # Do not race a stale or partially initialized hidden process. Stop it
     # before performing a fresh preflight and startup handshake.
     if (Test-GuardProcess) {
-        Remove-Item -LiteralPath $Script:ArmedPath -Force -ErrorAction SilentlyContinue
         New-Item -ItemType File -Path $Script:StopPath -Force | Out-Null
-        $oldProcessDeadline = [DateTime]::UtcNow.AddSeconds(6)
-        while ((Test-GuardProcess) -and [DateTime]::UtcNow -lt $oldProcessDeadline) {
+        $oldProcessWaitClock = [Diagnostics.Stopwatch]::StartNew()
+        while ((Test-GuardProcess) -and
+            ($oldProcessWaitClock.ElapsedMilliseconds -lt 6000)) {
             Start-Sleep -Milliseconds 200
         }
         if (Test-GuardProcess) {
-            throw 'An earlier guard process is still stopping. Run Disarm before retrying Arm.'
+            if (-not (Stop-OwnedGuardProcess)) {
+                throw ('An earlier owned guard process could not be stopped safely. ' +
+                    'The guard remains disarmed; retry Disarm.')
+            }
         }
         Remove-Item -LiteralPath $Script:StopPath -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $Script:ReadyPath -Force -ErrorAction SilentlyContinue
     }
+
+    if (-not (Wait-StartupLaunchersExit -Seconds 45)) {
+        throw ('An earlier startup supervisor is still stopping. The guard remains ' +
+            'disarmed; wait a few seconds, then retry Arm.')
+    }
+    if (-not (Test-GuardProcess)) {
+        Remove-Item -LiteralPath $Script:PidPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $Script:IdentityPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath ($Script:IdentityPath + '.tmp') -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $Script:ReadyPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath ($Script:ReadyPath + '.tmp') -Force -ErrorAction SilentlyContinue
+    }
+
+    # Sample exclusions only after all old processes have stopped. A network
+    # seen before that wait may no longer be connected when the new guard starts.
+    $activeWifi = @(Get-ActiveWifiNames)
+    $excludedWifi = Get-ExcludedWifiMatch -Config $config -ActiveNames $activeWifi
 
     if ($null -eq $excludedWifi) {
         Write-Host 'Checking the BLE phone before arming (up to 10 seconds)...'
@@ -2707,7 +4004,10 @@ function Arm-Guard {
 
     $startedProcess = $null
     try {
-        $startedProcess = Start-GuardProcess
+        # Arm the long-lived supervisor immediately instead of starting one
+        # unsupervised guard child.  Recovery therefore works now, not only
+        # after the next sign-in.
+        $startedProcess = Start-StartupSupervisorProcess
     }
     catch {
         Remove-Item -LiteralPath $Script:ArmedPath -Force -ErrorAction SilentlyContinue
@@ -2715,8 +4015,8 @@ function Arm-Guard {
     }
 
     $ready = $false
-    $deadline = [DateTime]::UtcNow.AddSeconds(20)
-    while ([DateTime]::UtcNow -lt $deadline) {
+    $readyWaitClock = [Diagnostics.Stopwatch]::StartNew()
+    while ($readyWaitClock.ElapsedMilliseconds -lt 45000) {
         if (Test-GuardReady) {
             # Require the ready signal and process to remain valid briefly.
             Start-Sleep -Milliseconds 400
@@ -2744,22 +4044,31 @@ function Arm-Guard {
         # bridges will then return before it can enter the monitoring loop.
         Remove-Item -LiteralPath $Script:ArmedPath -Force -ErrorAction SilentlyContinue
         New-Item -ItemType File -Path $Script:StopPath -Force | Out-Null
-        $stopDeadline = [DateTime]::UtcNow.AddSeconds(6)
-        while ((Test-GuardProcess) -and [DateTime]::UtcNow -lt $stopDeadline) {
+        $stopWaitClock = [Diagnostics.Stopwatch]::StartNew()
+        while ((Test-GuardProcess) -and
+            ($stopWaitClock.ElapsedMilliseconds -lt 6000)) {
             Start-Sleep -Milliseconds 200
         }
         $stillRunning = Test-GuardProcess
+        if ($stillRunning -and (Stop-OwnedGuardProcess)) {
+            $stillRunning = $false
+        }
         if (-not $stillRunning) {
             Remove-Item -LiteralPath $Script:StopPath -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $Script:PidPath -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $Script:IdentityPath -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath ($Script:IdentityPath + '.tmp') -Force -ErrorAction SilentlyContinue
             Remove-Item -LiteralPath $Script:ReadyPath -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath ($Script:ReadyPath + '.tmp') -Force -ErrorAction SilentlyContinue
         }
         if ($stillRunning) {
-            throw ('The guard did not become ready within 20 seconds. It is disarmed and a stop ' +
+            throw ('The guard did not become ready within 45 seconds. It is disarmed and a stop ' +
                 'was requested; check windows-ble-guard.log before retrying.')
         }
-        throw 'The guard did not become ready within 20 seconds and was stopped. Check windows-ble-guard.log.'
+        throw 'The guard did not become ready within 45 seconds and was stopped. Check windows-ble-guard.log.'
     }
-    Write-Host 'BLE Phone Input Guard is armed and will start automatically at sign-in.' -ForegroundColor Green
+    Write-Host ('BLE Phone Input Guard is armed, supervised, and will recover ' +
+        'automatically after sign-in, unlock, or system resume.') -ForegroundColor Green
 }
 
 function Disarm-Guard {
@@ -2770,15 +4079,31 @@ function Disarm-Guard {
         return
     }
     New-Item -ItemType File -Path $Script:StopPath -Force | Out-Null
-    $deadline = [DateTime]::UtcNow.AddSeconds(6)
-    while ((Test-GuardProcess) -and [DateTime]::UtcNow -lt $deadline) {
+    $stopWaitClock = [Diagnostics.Stopwatch]::StartNew()
+    while ((Test-GuardProcess) -and
+        ($stopWaitClock.ElapsedMilliseconds -lt 6000)) {
         Start-Sleep -Milliseconds 200
     }
     if (Test-GuardProcess) {
-        Write-Warning 'The process has not exited yet. Use the charger rescue if input is blocked.'
+        if (Stop-OwnedGuardProcess) {
+            Remove-Item -LiteralPath $Script:StopPath -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $Script:PidPath -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $Script:IdentityPath -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath ($Script:IdentityPath + '.tmp') -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $Script:ReadyPath -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath ($Script:ReadyPath + '.tmp') -Force -ErrorAction SilentlyContinue
+            Write-Host 'BLE Phone Input Guard was force-stopped safely; input is released.' -ForegroundColor Green
+        }
+        else {
+            Write-Warning ('The owned guard process could not be stopped safely. ' +
+                'Use the charger rescue if input remains blocked.')
+        }
     }
     else {
         Remove-Item -LiteralPath $Script:StopPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $Script:PidPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $Script:IdentityPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath ($Script:IdentityPath + '.tmp') -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $Script:ReadyPath -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath ($Script:ReadyPath + '.tmp') -Force -ErrorAction SilentlyContinue
         Write-Host 'BLE Phone Input Guard is disarmed; input is released.' -ForegroundColor Green
@@ -2827,6 +4152,7 @@ function Show-GuardCheck {
     else {
         $null
     }
+    $heartbeatAge = Get-GuardHeartbeatAgeSeconds
 
     [pscustomobject][ordered]@{
         Version             = $Script:GuardVersion
@@ -2838,10 +4164,12 @@ function Show-GuardCheck {
         StartupRunApproval  = Get-RunStartupApproval
         StartupTask         = if ([bool]$startupTask.Registered) {
             if (-not [bool]$startupTask.ActionMatches) { 'Outdated action' }
+            elseif (-not [bool]$startupTask.TriggersMatch) { 'Outdated recovery triggers' }
             elseif ([bool]$startupTask.Enabled) { [string]$startupTask.State }
             else { 'Disabled' }
         }
         else { 'Unavailable or missing' }
+        StartupTriggers     = [string]$startupTask.TriggerSummary
         StartupTaskResult   = [string]$startupTask.LastResult
         StartupTaskError    = [string]$startupTask.Error
         StartupLastStatus   = if ($null -ne $startupState) {
@@ -2856,6 +4184,10 @@ function Show-GuardCheck {
         LockRssi            = if ($installed) { [int]$config.lock_rssi_dbm } else { $null }
         UnlockRssi          = if ($installed) { [int]$config.unlock_rssi_dbm } else { $null }
         MissingTimeout      = if ($installed) { ([string]$config.absence_seconds + ' seconds') } else { $null }
+        HeartbeatAge        = if ($null -ne $heartbeatAge) {
+            ([string]$heartbeatAge + ' seconds')
+        }
+        else { 'Unavailable' }
         ActiveNetworks      = if ($activeWifi.Count) { $activeWifi -join ', ' } else { 'None' }
         ExclusionActive     = if ($null -ne $excludedWifi) { $excludedWifi } else { 'No' }
         EmergencyRelease    = '3 unplug/replug cycles; each state stable 1 second; all within 60 seconds'
@@ -2884,7 +4216,7 @@ function Uninstall-Guard {
 
     Remove-StartupLaunchers
 
-    if (-not (Wait-StartupLaunchersExit -Seconds 15)) {
+    if (-not (Wait-StartupLaunchersExit -Seconds 45)) {
         throw ('Refusing to remove the installation while its native startup ' +
             'launcher is still stopping. Wait a few seconds and run Uninstall again.')
     }

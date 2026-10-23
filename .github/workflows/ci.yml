@@ -81,10 +81,42 @@ jobs:
           $installed = Join-Path $env:LOCALAPPDATA `
             'KIDZ\phone-input-guard-windows-ble.ps1'
           $launcher = Join-Path $env:LOCALAPPDATA `
-            'KIDZ\phone-input-guard-startup-2.2.2.exe'
+            'KIDZ\phone-input-guard-startup-2.3.0.exe'
           $legacyLauncher = Join-Path $env:LOCALAPPDATA `
             'KIDZ\phone-input-guard-startup.vbs'
           'legacy test shim' | Set-Content -LiteralPath $legacyLauncher
+
+          # Simulate the deployed 2.2 layout: an old native action with only
+          # a logon trigger. RepairStartup must replace it during migration.
+          $migrationService = New-Object -ComObject 'Schedule.Service'
+          $migrationService.Connect()
+          $migrationRoot = $migrationService.GetFolder('\')
+          $migrationDefinition = $migrationService.NewTask(0)
+          $migrationUser = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+          $migrationDefinition.Principal.UserId = $migrationUser
+          $migrationDefinition.Principal.LogonType = 3
+          $migrationDefinition.Principal.RunLevel = 0
+          $migrationDefinition.Settings.Enabled = $true
+          $migrationDefinition.Settings.DisallowStartIfOnBatteries = $false
+          $migrationDefinition.Settings.StopIfGoingOnBatteries = $false
+          $oldTrigger = $migrationDefinition.Triggers.Create(9)
+          $oldTrigger.Enabled = $true
+          $oldTrigger.UserId = $migrationUser
+          $oldTrigger.Delay = 'PT5S'
+          $oldAction = $migrationDefinition.Actions.Create(0)
+          $oldAction.Path = Join-Path $env:LOCALAPPDATA `
+            'KIDZ\phone-input-guard-startup-2.2.0.exe'
+          $oldAction.Arguments = 'task'
+          $oldAction.WorkingDirectory = Split-Path -Parent $installed
+          $null = $migrationRoot.RegisterTaskDefinition(
+            'KIDZ Phone Input Guard Logon',
+            $migrationDefinition,
+            6,
+            $migrationUser,
+            $null,
+            3,
+            $null)
+
           & $installed RepairStartup
 
           if (-not (Test-Path -LiteralPath $launcher -PathType Leaf)) {
@@ -95,7 +127,7 @@ jobs:
           }
           $launcherVersion = [Diagnostics.FileVersionInfo]::GetVersionInfo(
             $launcher).FileVersion
-          if ([string]$launcherVersion -ne '2.2.2.0') {
+          if ([string]$launcherVersion -ne '2.3.0.0') {
             throw "Unexpected native startup launcher version: $launcherVersion"
           }
 
@@ -129,6 +161,8 @@ jobs:
             throw 'RepairStartup needlessly recompiled the valid launcher.'
           }
 
+          . $installed CompileOnly
+
           $service = New-Object -ComObject 'Schedule.Service'
           $service.Connect()
           $root = $service.GetFolder('\')
@@ -151,8 +185,189 @@ jobs:
                   [StringComparison]::Ordinal))) {
             throw 'The startup task action is not the expected native GUI command.'
           }
+          $triggers = @(
+            for ($i = 1; $i -le $task.Definition.Triggers.Count; $i++) {
+              $task.Definition.Triggers.Item($i)
+            }
+          )
+          $logonTriggers = @($triggers | Where-Object { [int]$_.Type -eq 9 })
+          $unlockTriggers = @($triggers | Where-Object {
+              ([int]$_.Type -eq 11) -and ([int]$_.StateChange -eq 8)
+            })
+          $resumeTriggers = @($triggers | Where-Object {
+              ([int]$_.Type -eq 0) -and
+              ([string]$_.Subscription -match
+                'Microsoft-Windows-Kernel-Power') -and
+              ([string]$_.Subscription -match 'EventID\s*=\s*107') -and
+              ([string]$_.Subscription -match 'EventID\s*=\s*507')
+            })
+          if (($triggers.Count -ne 3) -or
+              ($logonTriggers.Count -ne 1) -or
+              ($unlockTriggers.Count -ne 1) -or
+              ($resumeTriggers.Count -ne 1)) {
+            throw ('The startup task lacks the exact logon + session-unlock + resume ' +
+              'recovery triggers.')
+          }
+          foreach ($trigger in @($logonTriggers[0], $unlockTriggers[0])) {
+            if ((-not [bool]$trigger.Enabled) -or
+                (-not (Test-StartupTaskUserMatchesCurrentIdentity `
+                    -UserId ([string]$trigger.UserId)))) {
+              throw 'A startup recovery trigger is disabled or belongs to another user.'
+            }
+          }
+          if (([string]$logonTriggers[0].Delay -ne 'PT5S') -or
+              ([string]$unlockTriggers[0].Delay -ne 'PT2S') -or
+              ([string]$resumeTriggers[0].Delay -ne 'PT2S') -or
+              (-not [bool]$resumeTriggers[0].Enabled)) {
+            throw 'The startup recovery trigger delays are not the expected values.'
+          }
+          if ([int]$task.Definition.Settings.MultipleInstances -ne 2) {
+            throw 'The startup task does not ignore duplicate supervisor launches.'
+          }
+          if (-not $task.Definition.Settings.StartWhenAvailable) {
+            throw 'The startup task does not retain its requested availability setting.'
+          }
           if ($task.Definition.Settings.DisallowStartIfOnBatteries -or $task.Definition.Settings.StopIfGoingOnBatteries) {
             throw 'The startup task incorrectly stops or refuses to start on battery power.'
+          }
+
+          # Regression for a real lid-close failure: zero active Wi-Fi names
+          # must be a valid input, not a terminating parameter-binding error.
+          $runtimeTaskInfo = Get-StartupTaskInfo
+          if ((-not [bool]$runtimeTaskInfo.Registered) -or
+              (-not [bool]$runtimeTaskInfo.ActionMatches) -or
+              (-not [bool]$runtimeTaskInfo.TriggersMatch)) {
+            throw ('The script rejected its own repaired startup task: ' +
+              [string]$runtimeTaskInfo.Error)
+          }
+          $emptyWifiConfig = [pscustomobject]@{
+            excluded_wifi_names = @('XX1','XX2','XX3')
+          }
+          $emptyWifiMatch = Get-ExcludedWifiMatch `
+            -Config $emptyWifiConfig -ActiveNames @()
+          if ($null -ne $emptyWifiMatch) {
+            throw 'An empty active Wi-Fi list unexpectedly matched an exclusion.'
+          }
+
+          # A stale PID must never claim an unrelated process, while the
+          # version-2.2 ready-file identity remains recognized for migration.
+          $probePowerShell = Join-Path $env:SystemRoot `
+            'System32\WindowsPowerShell\v1.0\powershell.exe'
+          $identityProbe = Start-Process -FilePath $probePowerShell `
+            -ArgumentList '-NoProfile','-NonInteractive','-Command',
+              'Start-Sleep -Seconds 30' `
+            -WindowStyle Hidden -PassThru
+          try {
+            $identityProbe.Id | Set-Content -LiteralPath $Script:PidPath `
+              -Encoding ASCII
+            Remove-Item -LiteralPath $Script:IdentityPath,$Script:ReadyPath `
+              -Force -ErrorAction SilentlyContinue
+            if (Test-GuardProcess) {
+              throw 'A stale PID incorrectly claimed an unrelated process.'
+            }
+            $legacyReady = [pscustomobject]@{
+              pid = $identityProbe.Id
+              process_start_utc_ticks = `
+                $identityProbe.StartTime.ToUniversalTime().Ticks
+              ready_utc = [DateTime]::UtcNow.ToString('o')
+              version = '2.2.0'
+            }
+            $legacyReady | ConvertTo-Json | Set-Content `
+              -LiteralPath $Script:ReadyPath -Encoding UTF8
+            if (-not (Test-GuardProcess)) {
+              throw 'The safe version-2.2 process identity fallback was not recognized.'
+            }
+            $identityProbe.Refresh()
+            if ($identityProbe.HasExited) {
+              throw 'Ownership checks terminated the unrelated probe process.'
+            }
+
+            # A future heartbeat (for example after a wall-clock rollback)
+            # must not authorize an immediate kill. The same exact process
+            # and unchanged metadata may be recovered after a monotonic 20s
+            # observation supplied by the supervisor.
+            $legacyReady | Add-Member -NotePropertyName heartbeat_utc `
+              -NotePropertyValue ([DateTime]::UtcNow.AddHours(1).ToString('o'))
+            $legacyReady | ConvertTo-Json | Set-Content `
+              -LiteralPath $Script:ReadyPath -Encoding UTF8
+            $futureSnapshot = Get-GuardLivenessSnapshot
+            if ($null -eq $futureSnapshot) {
+              throw 'The future-heartbeat liveness snapshot was not captured.'
+            }
+            if (Stop-StaleGuardProcess -MinimumHeartbeatAgeSeconds 20 `
+                -ExpectedSnapshot $futureSnapshot `
+                -ObservedUnchangedMilliseconds 0) {
+              throw 'A future heartbeat authorized an immediate process kill.'
+            }
+            $identityProbe.Refresh()
+            if ($identityProbe.HasExited) {
+              throw 'The future-heartbeat safety check terminated the probe.'
+            }
+            if (-not (Stop-StaleGuardProcess -MinimumHeartbeatAgeSeconds 20 `
+                  -ExpectedSnapshot $futureSnapshot `
+                  -ObservedUnchangedMilliseconds 20000)) {
+              throw 'Monotonic unchanged-metadata recovery did not stop the probe.'
+            }
+            $identityProbe.Refresh()
+            if (-not $identityProbe.HasExited) {
+              throw 'Stale-process recovery returned success before confirmed exit.'
+            }
+          }
+          finally {
+            if (-not $identityProbe.HasExited) {
+              $identityProbe.Kill()
+              $null = $identityProbe.WaitForExit(5000)
+            }
+            $identityProbe.Dispose()
+            Remove-Item -LiteralPath $Script:PidPath,$Script:IdentityPath,
+              $Script:ReadyPath -Force -ErrorAction SilentlyContinue
+          }
+
+          $mutationProbe = Start-Process -FilePath $probePowerShell `
+            -ArgumentList '-NoProfile','-NonInteractive','-Command',
+              'Start-Sleep -Seconds 30' `
+            -WindowStyle Hidden -PassThru
+          try {
+            $mutationProbe.Id | Set-Content -LiteralPath $Script:PidPath `
+              -Encoding ASCII
+            $mutationReady = [pscustomobject]@{
+              pid = $mutationProbe.Id
+              process_start_utc_ticks = `
+                $mutationProbe.StartTime.ToUniversalTime().Ticks
+              heartbeat_utc = [DateTime]::UtcNow.AddHours(1).ToString('o')
+              version = '2.2.0'
+              marker = 1
+            }
+            $mutationReady | ConvertTo-Json | Set-Content `
+              -LiteralPath $Script:ReadyPath -Encoding UTF8
+            $beforeMutation = Get-GuardLivenessSnapshot
+            $mutationReady.marker = 2
+            $mutationReady | ConvertTo-Json | Set-Content `
+              -LiteralPath $Script:ReadyPath -Encoding UTF8
+            if (Stop-StaleGuardProcess -MinimumHeartbeatAgeSeconds 20 `
+                -ExpectedSnapshot $beforeMutation `
+                -ObservedUnchangedMilliseconds 20000) {
+              throw 'Changed liveness metadata incorrectly authorized termination.'
+            }
+            $mutationProbe.Refresh()
+            if ($mutationProbe.HasExited) {
+              throw 'The metadata-mutation guard terminated the probe process.'
+            }
+          }
+          finally {
+            if (-not $mutationProbe.HasExited) {
+              $mutationProbe.Kill()
+              $null = $mutationProbe.WaitForExit(5000)
+            }
+            $mutationProbe.Dispose()
+            Remove-Item -LiteralPath $Script:PidPath,$Script:IdentityPath,
+              $Script:ReadyPath -Force -ErrorAction SilentlyContinue
+          }
+          if ($null -eq $Script:BleWatcherBridgeType.GetMethod('Restart')) {
+            throw 'The BLE bridge lacks its suspend/resume restart method.'
+          }
+          if ($null -eq $Script:NativeMethodsType.GetMethod('GetMonotonicMilliseconds')) {
+            throw 'The native bridge lacks its suspend-aware monotonic clock.'
           }
 
           $runValue = (Get-ItemProperty `
@@ -177,17 +392,12 @@ jobs:
               [string]$invalid.ExitCode)
           }
 
-          # Execute the generated launcher while disarmed. This verifies the
-          # child-process command without ever allowing input blocking.
+          # Demand-start the registered task through the same path Arm uses,
+          # while disarmed so input blocking is impossible.
           $startupState = Join-Path $env:LOCALAPPDATA `
             'KIDZ\windows-ble-startup.json'
           Remove-Item -LiteralPath $startupState -Force -ErrorAction SilentlyContinue
-          $probe = Start-Process -FilePath $launcher -ArgumentList 'task' `
-            -Wait -PassThru
-          if ($probe.ExitCode -ne 0) {
-            throw ('The native startup launcher failed; exit code=' +
-              [string]$probe.ExitCode)
-          }
+          $null = Start-StartupSupervisorProcess
           $deadline = [DateTime]::UtcNow.AddSeconds(15)
           while ((-not (Test-Path -LiteralPath $startupState)) -and
               ([DateTime]::UtcNow -lt $deadline)) {
