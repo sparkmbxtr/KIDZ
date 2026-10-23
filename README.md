@@ -60,13 +60,19 @@ Unblock-File -LiteralPath '.\phone-input-guard-windows-ble.ps1', '.\windows-inpu
 Replace the zero UUID and each `XX` value. `LockRssi` is the weak-signal threshold, `UnlockRssi` is the stronger return threshold, and `AbsenceSeconds` is the time without a matching packet that counts as far. The gap between the two RSSI thresholds is hysteresis, which reduces rapid toggling near the boundary.
 
 Installation creates two non-admin, per-user startup paths: a limited scheduled
-task that starts five seconds after sign-in and an HKCU Run fallback. The
+task that starts after sign-in, workstation unlock, or a sleep/Modern Standby
+resume event, and an HKCU Run fallback. The
 fallback waits briefly so both launchers cannot create competing supervisors.
 Both paths use a locally generated Windows GUI-subsystem launcher. The launcher
 has no console and creates Windows PowerShell with `CREATE_NO_WINDOW`, so the
 default terminal cannot open a PowerShell window at sign-in.
 The startup supervisor retries transient Bluetooth/WinRT failures while the
-guard remains armed. Installation deliberately leaves the guard disarmed.
+guard remains armed. Supervised starts fail closed until a fresh phone packet or
+fresh exclusion-Wi-Fi result is seen. The guard recreates its BLE watcher after
+a lid-close, suspend/resume gap, or a `Stopped`/`Aborted` watcher state. A fresh
+heartbeat prevents a live but stalled process from being reported as ready. An empty
+active-Wi-Fi list is valid and means that no Wi-Fi exclusion applies.
+Installation deliberately leaves the guard disarmed.
 Validate it in this order:
 
 ```powershell
