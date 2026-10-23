@@ -489,6 +489,50 @@ function Get-RunStartupApproval {
     }
 }
 
+function Test-StartupTaskUserMatchesCurrentIdentity {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [string]$UserId
+    )
+
+    if ([string]::IsNullOrWhiteSpace($UserId)) {
+        return $false
+    }
+
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    foreach ($expectedUserId in @(
+            [string]$identity.Name,
+            [string]$identity.User.Value
+        )) {
+        if ((-not [string]::IsNullOrWhiteSpace($expectedUserId)) -and
+            [string]::Equals(
+                $UserId,
+                $expectedUserId,
+                [StringComparison]::OrdinalIgnoreCase)) {
+            return $true
+        }
+    }
+
+    # Task Scheduler can also return an unqualified or otherwise normalized
+    # account name. Resolve that account back to its SID so validation remains
+    # strict without depending on the COM API's chosen string representation.
+    try {
+        $account = New-Object -TypeName Security.Principal.NTAccount `
+            -ArgumentList $UserId
+        $resolvedSid = $account.Translate(
+            [Security.Principal.SecurityIdentifier])
+        return [string]::Equals(
+            [string]$resolvedSid.Value,
+            [string]$identity.User.Value,
+            [StringComparison]::OrdinalIgnoreCase)
+    }
+    catch {
+    }
+    return $false
+}
+
 function Get-StartupTaskInfo {
     $stateNames = @{
         0 = 'Unknown'
@@ -519,8 +563,6 @@ function Get-StartupTaskInfo {
                 $Script:InstallRoot,
                 [StringComparison]::OrdinalIgnoreCase))
         $triggerCount = [int]$task.Definition.Triggers.Count
-        $currentUserId = [string](
-            [Security.Principal.WindowsIdentity]::GetCurrent().User.Value)
         $hasLogonTrigger = $false
         $hasUnlockTrigger = $false
         $hasResumeTrigger = $false
@@ -528,10 +570,8 @@ function Get-StartupTaskInfo {
             $registeredTrigger = $task.Definition.Triggers.Item($triggerIndex)
             $registeredTriggerType = [int]$registeredTrigger.Type
             if ($registeredTriggerType -eq 9) {
-                $triggerUserMatches = [string]::Equals(
-                    [string]$registeredTrigger.UserId,
-                    $currentUserId,
-                    [StringComparison]::OrdinalIgnoreCase)
+                $triggerUserMatches = Test-StartupTaskUserMatchesCurrentIdentity `
+                    -UserId ([string]$registeredTrigger.UserId)
                 if ([bool]$registeredTrigger.Enabled -and
                     $triggerUserMatches -and
                     [string]::Equals(
@@ -542,10 +582,8 @@ function Get-StartupTaskInfo {
                 }
             }
             elseif ($registeredTriggerType -eq 11) {
-                $triggerUserMatches = [string]::Equals(
-                    [string]$registeredTrigger.UserId,
-                    $currentUserId,
-                    [StringComparison]::OrdinalIgnoreCase)
+                $triggerUserMatches = Test-StartupTaskUserMatchesCurrentIdentity `
+                    -UserId ([string]$registeredTrigger.UserId)
                 if (([int]$registeredTrigger.StateChange -eq 8) -and
                     [bool]$registeredTrigger.Enabled -and
                     $triggerUserMatches -and
@@ -593,6 +631,9 @@ function Get-StartupTaskInfo {
             ActionMatches = $actionMatches
             TriggerCount = $triggerCount
             TriggersMatch = $triggersMatch
+            HasLogonTrigger = $hasLogonTrigger
+            HasUnlockTrigger = $hasUnlockTrigger
+            HasResumeTrigger = $hasResumeTrigger
             TriggerSummary = $(if ($triggersMatch) {
                     'Logon + session unlock + system resume'
                 }
@@ -613,6 +654,9 @@ function Get-StartupTaskInfo {
             ActionMatches = $false
             TriggerCount = 0
             TriggersMatch = $false
+            HasLogonTrigger = $false
+            HasUnlockTrigger = $false
+            HasResumeTrigger = $false
             TriggerSummary = 'Missing'
             Error      = $_.Exception.Message
         }
@@ -723,7 +767,10 @@ function Install-StartupLaunchers {
         # This task uses the current interactive user's token and limited run
         # level.  It neither requests elevation nor stores a password.
         $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-        $userId = [string]$identity.User.Value
+        # Task Scheduler can canonicalize an interactive-token identity to its
+        # account name even when registration supplied a SID. Register with the
+        # canonical account name and accept either form during verification.
+        $userId = [string]$identity.Name
         $service = New-Object -ComObject 'Schedule.Service'
         $service.Connect()
         $rootFolder = $service.GetFolder('\')
@@ -812,12 +859,22 @@ function Install-StartupLaunchers {
         ((-not [bool]$registeredTask.ActionMatches) -or
             (-not [bool]$registeredTask.TriggersMatch))) {
         $taskInstalled = $false
+        $verificationDetail = (
+            'Verification failed: action={0}; triggers={1}; count={2}; ' +
+            'logon={3}; unlock={4}; resume={5}.' -f
+            [bool]$registeredTask.ActionMatches,
+            [bool]$registeredTask.TriggersMatch,
+            [int]$registeredTask.TriggerCount,
+            [bool]$registeredTask.HasLogonTrigger,
+            [bool]$registeredTask.HasUnlockTrigger,
+            [bool]$registeredTask.HasResumeTrigger)
         try {
             $cleanupService = New-Object -ComObject 'Schedule.Service'
             $cleanupService.Connect()
             $cleanupService.GetFolder('\').DeleteTask($Script:StartupTaskName, 0)
-            $taskError = (($taskError + ' Existing startup task used an outdated action ' +
-                    'or recovery trigger and was removed.').Trim())
+            $taskError = (($taskError + ' ' + $verificationDetail +
+                    ' Existing startup task used an outdated action or recovery ' +
+                    'trigger and was removed.').Trim())
         }
         catch {
             $staleTaskError = ('An outdated scheduled startup task could not be removed: ' +
