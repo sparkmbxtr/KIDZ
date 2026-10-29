@@ -11,13 +11,15 @@ Quick installation:
     chmod +x phone-input-guard.py
     sudo ./phone-input-guard.py install
 
-The installer lists paired Bluetooth devices, lets you select the phone, and
-starts the systemd service only after it confirms that the phone is connected.
+BR/EDR is the default. Optional BLE mode uses the same advertised 128-bit
+service UUID as the Windows guard, without pairing or connecting to the phone.
+BLE installation stays disarmed; use observe, self-test, then arm.
 
 Important: for the selected phone's BR/EDR link, "nearby" means that BlueZ
 reports both an active connection and an RSSI value in or above the controller's
-Golden Receive Power Range.  The measured calibration for this installation is
-nearby at RSSI >= 0 and distant at RSSI < 0.  A disconnection is always distant.
+Golden Receive Power Range. The default is nearby at RSSI >= 0 and distant at
+RSSI < 0. A disconnection is always distant. BLE instead uses absolute dBm
+thresholds with hysteresis and a configurable advertisement-loss timeout.
 
 Emergency rescue: while the phone is absent, complete three full charger
 unplug -> reconnect cycles within 60 seconds.  Each power state must remain
@@ -27,13 +29,16 @@ stable for one second.  Input is then released until the phone returns nearby.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import ast
+import contextlib
 import ctypes
 import ctypes.util
 import errno
 import fcntl
 import json
 import logging
+import math
 import os
 import pwd
 import re
@@ -46,14 +51,15 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 
 APP_NAME = "phone-input-guard"
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 INSTALL_PATH = Path("/usr/local/sbin/phone-input-guard")
 CONFIG_PATH = Path("/etc/phone-input-guard.json")
 SERVICE_PATH = Path("/etc/systemd/system/phone-input-guard.service")
@@ -121,7 +127,14 @@ DEFAULT_WIFI_EXCLUSIONS = ["XX1", "XX2", "XX3"]
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
+    "proximity_mode": "bredr",
     "phone_address": "",
+    # Absolute advertisement RSSI in dBm, separate from BR/EDR relative RSSI.
+    "ble_service_uuid": "",
+    "ble_lock_rssi_dbm": -84,
+    "ble_unlock_rssi_dbm": -80,
+    "ble_absence_seconds": 11.0,
+    "ble_adapter": "",
     # This is a polling interval, not an absence grace period.  The first
     # disconnected or distant result freezes input immediately.
     "poll_seconds": 0.35,
@@ -157,7 +170,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
 
 
 SYSTEMD_SERVICE = f"""[Unit]
-Description=Freeze keyboard and pointer input when the paired phone is distant
+Description=Freeze keyboard and pointer input when the Bluetooth phone is distant
 Documentation=https://www.kernel.org/doc/html/latest/input/input.html
 Wants=bluetooth.service
 After=bluetooth.service NetworkManager.service systemd-udevd.service
@@ -638,6 +651,8 @@ class WifiExclusionMonitor:
         self.startup_settle_seconds = startup_settle_seconds
         self._started_at = time.monotonic()
         self._active_names: Optional[set[str]] = None
+        self._sampled_at = float("-inf")
+        self._suspend_offset = 0.0
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread = threading.Thread(
@@ -654,9 +669,14 @@ class WifiExclusionMonitor:
 
     def _worker(self) -> None:
         while not self._stop.is_set():
+            sampled_at = elapsed_seconds()
+            suspend_offset = sampled_at - time.monotonic()
             current = active_wifi_names()
             with self._lock:
                 self._active_names = current
+                # A query spanning suspend must not relabel an old result as fresh.
+                self._sampled_at = sampled_at
+                self._suspend_offset = suspend_offset
             self._stop.wait(self.poll_seconds)
 
     def decision(self) -> WifiPolicyDecision:
@@ -664,6 +684,12 @@ class WifiExclusionMonitor:
             return WifiPolicyDecision(False, "no Wi-Fi exclusions configured", ())
         with self._lock:
             current = None if self._active_names is None else set(self._active_names)
+            # Never retain an exclusion through a suspended/stalled Wi-Fi probe.
+            if (
+                elapsed_seconds() - self._sampled_at > max(3.0, 3 * self.poll_seconds)
+                or abs(elapsed_seconds() - time.monotonic() - self._suspend_offset) > 0.5
+            ):
+                current = None
         names = tuple(sorted(current or set(), key=str.casefold))
         if current:
             for name in names:
@@ -844,7 +870,8 @@ class InputGrabber:
     def discard_input(self) -> None:
         """Drain and discard events so grabbed-device queues cannot accumulate."""
         for path, device in list(self._devices.items()):
-            while True:
+            # Continuous input must not starve Bluetooth polling or charger rescue.
+            for _ in range(32):
                 try:
                     data = os.read(device.file_descriptor, 4096)
                 except BlockingIOError:
@@ -2368,6 +2395,331 @@ class BluezPresence:
             process.terminate()
 
 
+def elapsed_seconds() -> float:
+    """Monotonic elapsed time including Linux suspend, independent of wall time."""
+    return time.clock_gettime(time.CLOCK_BOOTTIME)
+
+
+def normalize_service_uuid(value: str) -> str:
+    if not isinstance(value, str) or not re.fullmatch(
+        r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", value
+    ):
+        raise ValueError("ble_service_uuid must be a full 128-bit UUID")
+    normalized = str(uuid.UUID(value))
+    if normalized in (str(uuid.UUID(int=0)), "00000000-0000-4000-8000-000000000000"):
+        raise ValueError("replace the public UUID placeholder with the phone advertiser's UUID")
+    return normalized
+
+
+class BleProximityState:
+    """Packet-driven hysteresis. Caller serializes access; no cached discovery reads."""
+
+    def __init__(self, service_uuid: str, lock_rssi: int, unlock_rssi: int,
+                 absence_seconds: float) -> None:
+        self.service_uuid = normalize_service_uuid(service_uuid)
+        self.lock_rssi = lock_rssi
+        self.unlock_rssi = unlock_rssi
+        self.absence_seconds = absence_seconds
+        self.packet_count = 0
+        self.invalidate("waiting for a fresh strong BLE advertisement")
+
+    def invalidate(self, reason: str) -> None:
+        self.near = False
+        self.last_seen: Optional[float] = None
+        self.rssi: Optional[int] = None
+        self.reason = reason
+
+    def _expire(self, now: float) -> None:
+        if self.last_seen is not None and now - self.last_seen >= self.absence_seconds:
+            self.near = False
+            self.reason = "matching BLE advertisements missing"
+
+    def advertisement(self, service_uuids: Iterable[str], rssi: Any, now: float) -> bool:
+        # A UUID is the identifier, not the phone's name or rotating BLE address.
+        if self.service_uuid not in {str(value).lower() for value in service_uuids}:
+            return False
+        if isinstance(rssi, bool) or not isinstance(rssi, int) or not -127 <= rssi <= 20:
+            return False  # Includes HCI's 127 = unavailable sentinel.
+        self._expire(now)
+        self.last_seen = now
+        self.rssi = rssi
+        self.packet_count += 1
+        if rssi >= self.unlock_rssi:
+            self.near = True
+            self.reason = "strong BLE advertisement"
+        elif rssi <= self.lock_rssi:
+            self.near = False
+            self.reason = "weak BLE advertisement"
+        else:
+            self.reason = "BLE RSSI in hysteresis band; retaining state"
+        return True
+
+    def sample(self, now: float) -> BluetoothPresenceSample:
+        self._expire(now)
+        receiving = self.last_seen is not None and now - self.last_seen < self.absence_seconds
+        # connected means a fresh observation in this transport; BLE never connects.
+        return BluetoothPresenceSample(receiving, self.near, "BLE advertisement",
+                                       self.rssi, self.reason)
+
+
+class BluezAdvertisementScanner:
+    """A private BlueZ discovery session; cached properties never imply presence.
+
+    Only InterfacesAdded with RSSI and PropertiesChanged containing RSSI count
+    as observations. In particular, Connected/Name updates cannot replay an
+    old RSSI. Each session owns and closes its own system-bus connection.
+    """
+
+    def __init__(self, detection_callback: Callable[..., None], service_uuids: list[str],
+                 bluez: dict[str, Any]) -> None:
+        try:
+            from dbus_fast import BusType, Message, MessageType, Variant
+            from dbus_fast.aio import MessageBus
+        except ImportError as error:
+            raise SystemExit("BLE mode needs D-Bus support: install Ubuntu's python3-dbus-fast package.") from error
+        self._Message, self._MessageType, self._Variant = Message, MessageType, Variant
+        self._bus = MessageBus(bus_type=BusType.SYSTEM)
+        self._callback = detection_callback
+        self._service_uuids = service_uuids
+        self._adapter_name = bluez.get("adapter", "")
+        self._adapter_path: Optional[str] = None
+        self._devices: dict[str, list[str]] = {}
+        self._active = False
+        self._discovery_started = False
+        self._interrupted = False
+
+    async def _call(self, destination: str, path: str, interface: str, member: str,
+                    signature: str = "", body: Optional[list[Any]] = None) -> Any:
+        reply = await self._bus.call(self._Message(destination=destination, path=path,
+                                                  interface=interface, member=member,
+                                                  signature=signature, body=body or []))
+        if reply is None or reply.message_type == self._MessageType.ERROR:
+            raise OSError(f"BlueZ D-Bus {member} failed")
+        return reply.body
+
+    @staticmethod
+    def _values(properties: dict[str, Any]) -> dict[str, Any]:
+        return {key: value.value for key, value in properties.items()}
+
+    def _device_update(self, path: str, properties: dict[str, Any]) -> None:
+        if self._adapter_path is None or not path.startswith(self._adapter_path + "/"):
+            return
+        values = self._values(properties)
+        if "UUIDs" in values:
+            self._devices[path] = values["UUIDs"]
+        if self._active and not self._interrupted and "RSSI" in values:
+            # No cache of RSSI is maintained, even for a known UUID/device.
+            self._callback(None, argparse.Namespace(service_uuids=self._devices.get(path, []), rssi=values["RSSI"]))
+
+    def _message(self, message: Any) -> None:
+        if message.message_type != self._MessageType.SIGNAL:
+            return
+        if message.interface == "org.freedesktop.DBus" and message.member == "NameOwnerChanged":
+            if message.body[0] == "org.bluez":
+                self._interrupted = True
+        elif message.interface == "org.freedesktop.DBus.ObjectManager":
+            path, interfaces = message.body
+            if message.member == "InterfacesAdded" and "org.bluez.Device1" in interfaces:
+                self._device_update(path, interfaces["org.bluez.Device1"])
+            elif message.member == "InterfacesRemoved":
+                if path == self._adapter_path and "org.bluez.Adapter1" in interfaces:
+                    self._interrupted = True
+                self._devices.pop(path, None)
+        elif message.interface == "org.freedesktop.DBus.Properties" and message.member == "PropertiesChanged":
+            interface, changed, invalidated = message.body
+            if interface == "org.bluez.Device1":
+                if "UUIDs" in invalidated:
+                    self._devices.pop(message.path, None)
+                self._device_update(message.path, changed)
+            elif interface == "org.bluez.Adapter1" and message.path == self._adapter_path:
+                values = self._values(changed)
+                if (values.get("Powered") is False or values.get("Discovering") is False
+                        or "Powered" in invalidated or "Discovering" in invalidated):
+                    self._interrupted = True
+
+    async def start(self) -> None:
+        await self._bus.connect()
+        self._bus.add_message_handler(self._message)
+        for rule in (
+            "type='signal',sender='org.bluez',interface='org.freedesktop.DBus.ObjectManager'",
+            "type='signal',sender='org.bluez',interface='org.freedesktop.DBus.Properties',path_namespace='/org/bluez'",
+            "type='signal',sender='org.freedesktop.DBus',interface='org.freedesktop.DBus',member='NameOwnerChanged',arg0='org.bluez'",
+        ):
+            await self._call("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "AddMatch", "s", [rule])
+        objects = (await self._call("org.bluez", "/", "org.freedesktop.DBus.ObjectManager", "GetManagedObjects"))[0]
+        for path, interfaces in sorted(objects.items()):
+            adapter = interfaces.get("org.bluez.Adapter1")
+            if adapter is not None and (not self._adapter_name or path == f"/org/bluez/{self._adapter_name}"):
+                if self._values(adapter).get("Powered"):
+                    self._adapter_path = path
+                    break
+        if self._adapter_path is None:
+            raise OSError("No powered BLE adapter available")
+        # Remember advertised service identities, but never cached signal strength.
+        for path, interfaces in objects.items():
+            if "org.bluez.Device1" in interfaces:
+                self._device_update(path, {key: value for key, value in interfaces["org.bluez.Device1"].items() if key == "UUIDs"})
+        filters = {"UUIDs": self._Variant("as", self._service_uuids),
+                   "Transport": self._Variant("s", "le"), "DuplicateData": self._Variant("b", True)}
+        await self._call("org.bluez", self._adapter_path, "org.bluez.Adapter1", "SetDiscoveryFilter", "a{sv}", [filters])
+        await self._call("org.bluez", self._adapter_path, "org.bluez.Adapter1", "StartDiscovery")
+        self._discovery_started = True
+        self._active = True
+
+    @property
+    def interrupted(self) -> bool:
+        return self._interrupted or not self._bus.connected
+
+    async def stop(self) -> None:
+        self._active = False
+        try:
+            if self._discovery_started and self._bus.connected:
+                await self._call("org.bluez", self._adapter_path, "org.bluez.Adapter1", "StopDiscovery")
+        finally:
+            self._bus.disconnect()  # Also drops this client's discovery filter/session.
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(self._bus.wait_for_disconnect(), timeout=0.5)
+
+
+class BleAdvertisementPresence:
+    """Own a BlueZ scanner in a worker; input/rescue never wait on D-Bus.
+
+    A fresh connection/session on every retry recovers Bluetooth and bus
+    restarts. Silence recycles discovery after the advertisement-loss timeout.
+    """
+
+    backend = "BLE advertisements (BlueZ D-Bus)"
+
+    def __init__(self, config: dict[str, Any], scanner_factory: Optional[Callable[..., Any]] = None) -> None:
+        if scanner_factory is None:
+            try:
+                import dbus_fast  # noqa: F401 -- dependency check before install/arming
+            except ImportError as error:
+                raise SystemExit("BLE mode needs D-Bus support: install Ubuntu's python3-dbus-fast package.") from error
+            scanner_factory = BluezAdvertisementScanner
+        self._scanner_factory = scanner_factory
+        self._state = BleProximityState(config["ble_service_uuid"], config["ble_lock_rssi_dbm"],
+                                        config["ble_unlock_rssi_dbm"], config["ble_absence_seconds"])
+        self._adapter = config["ble_adapter"]
+        self._retry_seconds = config["reconnect_every_seconds"]
+        self._stall_seconds = max(5.0, 4 * config["poll_seconds"])
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._restart = threading.Event()
+        self._thread = threading.Thread(target=self._worker, name="ble-advertisement-monitor", daemon=True)
+        self._generation = 0
+        self._last_tick = elapsed_seconds()
+        self._last_sample = self._last_tick
+        self._suspend_offset = self._last_tick - time.monotonic()
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def _invalidate(self, reason: str) -> None:
+        # Invalidate the callback token before attempting scanner shutdown.
+        self._generation += 1
+        self._state.invalidate(reason)
+
+    def _callback(self, generation: int, _device: Any, advertisement: Any) -> None:
+        with self._lock:
+            if generation != self._generation or self._stop.is_set() or self._restart.is_set():
+                return
+            self._state.advertisement(advertisement.service_uuids or (), advertisement.rssi, elapsed_seconds())
+
+    async def _scan_once(self) -> None:
+        with self._lock:
+            self._restart.clear()
+            self._invalidate("BLE scanner restarting; waiting for a fresh strong advertisement")
+            self._last_tick = elapsed_seconds()
+            generation = self._generation
+        # DuplicateData=True requests repeated updates instead of deduplicated data.
+        bluez: dict[str, Any] = {"filters": {"DuplicateData": True}}
+        if self._adapter:
+            bluez["adapter"] = self._adapter
+        accepting = False
+
+        def detected(device: Any, adv: Any) -> None:
+            # Ignore startup cache replay; subsequent callbacks are live updates.
+            if accepting:
+                self._callback(generation, device, adv)
+
+        scanner = self._scanner_factory(
+            detection_callback=detected,
+            service_uuids=[self._state.service_uuid], bluez=bluez,
+        )
+        try:
+            await asyncio.wait_for(scanner.start(), timeout=5.0)
+            accepting = True
+            started_at = elapsed_seconds()
+            with self._lock:
+                self._last_tick = started_at
+            while not self._stop.is_set() and not self._restart.is_set():
+                now = elapsed_seconds()
+                with self._lock:
+                    gap = now - self._last_tick
+                    self._last_tick = now
+                    last_seen = self._state.last_seen
+                if (scanner.interrupted or gap > self._stall_seconds
+                        or now - (last_seen if last_seen is not None else started_at) >= self._state.absence_seconds):
+                    break  # Resume, silent scan abort, adapter loss or phone absent.
+                await asyncio.sleep(0.1)
+        finally:
+            with self._lock:
+                self._invalidate("BLE scan interrupted; waiting for a fresh strong advertisement")
+            # A broken bus must not hold up input release or the next scan forever.
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(scanner.stop(), timeout=2.0)
+
+    def _worker(self) -> None:
+        while not self._stop.is_set():
+            try:
+                asyncio.run(self._scan_once())
+            except Exception as error:
+                with self._lock:
+                    self._invalidate("BLE scanner unavailable; retrying")
+                # Exception messages can contain Bluetooth addresses. Keep them local
+                # to the backend and report only the exception type in normal logs.
+                LOG.warning("BLE scan failed (%s); retrying", type(error).__name__)
+            self._stop.wait(self._retry_seconds)
+
+    def sample(self) -> BluetoothPresenceSample:
+        now = elapsed_seconds()
+        suspend_offset = now - time.monotonic()
+        with self._lock:
+            if (now - self._last_sample > self._stall_seconds
+                    or abs(suspend_offset - self._suspend_offset) > 0.5
+                    or now - self._last_tick > self._stall_seconds):
+                self._invalidate("resume or stalled BLE scanner; waiting for a fresh strong advertisement")
+                self._restart.set()
+            self._last_sample = now
+            self._suspend_offset = suspend_offset
+            return self._state.sample(now)
+
+    @property
+    def packet_count(self) -> int:
+        with self._lock:
+            return self._state.packet_count
+
+    def maybe_reconnect(self) -> None:
+        pass  # Advertisements require neither pairing nor a GATT connection.
+
+    def stop(self) -> None:
+        self._stop.set()
+        with self._lock:
+            self._invalidate("BLE scanner stopped")
+        if self._thread.is_alive():
+            self._thread.join(timeout=3.0)
+
+
+def create_presence(config: dict[str, Any]) -> Any:
+    if config["proximity_mode"] == "ble":
+        presence = BleAdvertisementPresence(config)
+        presence.start()
+        return presence
+    return BluezPresence(config["phone_address"], config["reconnect_every_seconds"],
+                         config["bredr_rssi_proximity"], config["bredr_rssi_lock_below"])
+
+
 def load_config(path: Path) -> dict[str, Any]:
     try:
         supplied = json.loads(path.read_text(encoding="utf-8"))
@@ -2377,10 +2729,29 @@ def load_config(path: Path) -> dict[str, Any]:
         raise SystemExit(f"Invalid JSON in {path}: {error}") from error
     if not isinstance(supplied, dict):
         raise SystemExit(f"Configuration root must be an object: {path}")
+    return validate_config(supplied, str(path))
+
+
+def validate_config(supplied: dict[str, Any], source: str = "configuration") -> dict[str, Any]:
     config = DEFAULT_CONFIG.copy()
     config.update(supplied)
     try:
-        config["phone_address"] = normalize_address(str(config["phone_address"]))
+        if config["proximity_mode"] not in ("bredr", "ble"):
+            raise ValueError("proximity_mode must be bredr or ble")
+        if config["proximity_mode"] == "bredr":
+            config["phone_address"] = normalize_address(str(config["phone_address"]))
+        else:
+            config["ble_service_uuid"] = normalize_service_uuid(config["ble_service_uuid"])
+            for key in ("ble_lock_rssi_dbm", "ble_unlock_rssi_dbm"):
+                if type(config[key]) is not int or not -127 <= config[key] <= 20:
+                    raise ValueError(f"{key} must be an integer between -127 and 20 dBm")
+            if config["ble_lock_rssi_dbm"] >= config["ble_unlock_rssi_dbm"]:
+                raise ValueError("BLE lock RSSI must be lower than unlock RSSI")
+            config["ble_absence_seconds"] = float(config["ble_absence_seconds"])
+            if not math.isfinite(config["ble_absence_seconds"]) or not 1 <= config["ble_absence_seconds"] <= 300:
+                raise ValueError("ble_absence_seconds must be finite and between 1 and 300")
+            if not isinstance(config["ble_adapter"], str) or not re.fullmatch(r"(?:hci\d+)?", config["ble_adapter"]):
+                raise ValueError("ble_adapter must be empty (automatic) or hci followed by a number")
         config["poll_seconds"] = max(0.10, float(config["poll_seconds"]))
         config["reconnect_every_seconds"] = max(
             0.5, float(config["reconnect_every_seconds"])
@@ -2412,6 +2783,10 @@ def load_config(path: Path) -> dict[str, Any]:
         config["wifi_startup_settle_seconds"] = max(
             0.0, float(config["wifi_startup_settle_seconds"])
         )
+        for key in ("poll_seconds", "reconnect_every_seconds", "rescue_window_seconds",
+                    "power_state_debounce_seconds", "wifi_poll_seconds", "wifi_startup_settle_seconds"):
+            if not math.isfinite(float(supplied.get(key, config[key]))):
+                raise ValueError(f"{key} must be finite")
         config["locked_banner_template"] = str(config["locked_banner_template"])
         if not config["locked_banner_template"].strip():
             raise ValueError("locked_banner_template cannot be empty")
@@ -2420,13 +2795,33 @@ def load_config(path: Path) -> dict[str, Any]:
         for pattern in config["exclude_device_name_regex"]:
             re.compile(str(pattern))
     except (TypeError, ValueError, re.error) as error:
-        raise SystemExit(f"Invalid setting in {path}: {error}") from error
+        raise SystemExit(f"Invalid setting in {source}: {error}") from error
     return config
 
 
 def run_guard(config_path: Path, dry_run: bool = False) -> int:
     if not dry_run:
         require_root("The input guard")
+    with contextlib.nullcontext() if dry_run else exclusive_input_session():
+        return _run_guard(config_path, dry_run)
+
+
+@contextlib.contextmanager
+def exclusive_input_session() -> Iterable[None]:
+    """A self-test and an armed foreground/systemd guard must never overlap."""
+    PANEL_RUNTIME_DIR.mkdir(mode=0o755, parents=True, exist_ok=True)
+    descriptor = os.open(PANEL_RUNTIME_DIR / "input.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise SystemExit("An input guard or self-test is already running; disarm it first.") from error
+        yield
+    finally:
+        os.close(descriptor)
+
+
+def _run_guard(config_path: Path, dry_run: bool = False) -> int:
     config = load_config(config_path)
     stop_event = threading.Event()
 
@@ -2436,12 +2831,7 @@ def run_guard(config_path: Path, dry_run: bool = False) -> int:
     signal.signal(signal.SIGTERM, stop_handler)
     signal.signal(signal.SIGINT, stop_handler)
 
-    presence = BluezPresence(
-        config["phone_address"],
-        config["reconnect_every_seconds"],
-        config["bredr_rssi_proximity"],
-        config["bredr_rssi_lock_below"],
-    )
+    presence = create_presence(config)
     grabber = InputGrabber(config["exclude_device_name_regex"])
     power_rescue = PowerCycleRescue(
         config["rescue_power_cycles"],
@@ -2453,20 +2843,23 @@ def run_guard(config_path: Path, dry_run: bool = False) -> int:
     wifi_monitor = WifiExclusionMonitor(
         config["excluded_wifi_connections"],
         config["wifi_poll_seconds"],
-        config["wifi_startup_settle_seconds"],
+        # BLE starts far until a fresh packet or actual Wi-Fi match arrives.
+        0.0 if config["proximity_mode"] == "ble" else config["wifi_startup_settle_seconds"],
     )
-    wifi_monitor.start()
     rescue_active = False
     previous_present: Optional[bool] = None
     previous_link_connected: Optional[bool] = None
     previous_wifi_decision: Optional[WifiPolicyDecision] = None
 
     LOG.info(
-        "Watching %s via %s; absence grace is 0 seconds",
-        config["phone_address"],
+        "Watching %s proximity via %s",
+        config["proximity_mode"],
         presence.backend,
     )
-    if config["bredr_rssi_proximity"]:
+    if config["proximity_mode"] == "ble":
+        LOG.info("BLE thresholds: lock <= %d dBm, unlock >= %d dBm; loss timeout %.1f seconds",
+                 config["ble_lock_rssi_dbm"], config["ble_unlock_rssi_dbm"], config["ble_absence_seconds"])
+    elif config["bredr_rssi_proximity"]:
         LOG.info(
             "BR/EDR proximity rule: freeze on first RSSI below %d; "
             "release at %d or above",
@@ -2492,7 +2885,10 @@ def run_guard(config_path: Path, dry_run: bool = False) -> int:
         LOG.warning("No Wi-Fi exclusions configured; guard is active on every network")
 
     try:
+        wifi_monitor.start()
         while not stop_event.is_set():
+            # Keep expiry/resume detection running even under a Wi-Fi exclusion.
+            sample = presence.sample()
             wifi_decision = wifi_monitor.decision()
             if wifi_decision != previous_wifi_decision:
                 LOG.info(
@@ -2511,14 +2907,14 @@ def run_guard(config_path: Path, dry_run: bool = False) -> int:
                 previous_wifi_decision = wifi_decision
 
             if wifi_decision.paused:
-                overlay.hide()
-                display_awake.release()
-                if grabber.is_grabbed:
-                    grabber.release_all()
+                if not dry_run:
+                    overlay.hide()
+                    display_awake.release()
+                    if grabber.is_grabbed:
+                        grabber.release_all()
                 stop_event.wait(config["poll_seconds"])
                 continue
 
-            sample = presence.sample()
             present = sample.present
 
             if (
@@ -2560,8 +2956,8 @@ def run_guard(config_path: Path, dry_run: bool = False) -> int:
                 if grabber.is_grabbed:
                     grabber.release_all()
             else:
-                # No counter and no timer: the first disconnected or negative
-                # BR/EDR RSSI result reaches this branch immediately.
+                # Each detector owns its thresholds/timeout. The grab/rescue,
+                # display and GNOME paths are shared by both transports.
                 grabber.grab_all()
                 grabber.discard_input()
                 display_awake.hold()
@@ -2569,11 +2965,15 @@ def run_guard(config_path: Path, dry_run: bool = False) -> int:
 
             stop_event.wait(config["poll_seconds"])
     finally:
-        overlay.hide()
-        display_awake.release()
-        grabber.release_all()
-        presence.stop()
-        wifi_monitor.stop()
+        # ExitStack runs every cleanup even if an indicator or backend raises.
+        # Release physical devices first, before any potentially slow D-Bus work.
+        with contextlib.ExitStack() as cleanup:
+            cleanup.callback(wifi_monitor.stop)
+            cleanup.callback(presence.stop)
+            if not dry_run:
+                cleanup.callback(display_awake.release)
+                cleanup.callback(overlay.hide)
+                cleanup.callback(grabber.release_all)
         LOG.info("Stopped; all input grabs released")
     return 0
 
@@ -2582,17 +2982,74 @@ def bluetooth_connected(address: str) -> bool:
     return BluezPresence(address, reconnect_every_seconds=2.0).connected()
 
 
-def configured_bluetooth_presence(config: dict[str, Any]) -> BluetoothPresenceSample:
-    presence = BluezPresence(
-        config["phone_address"],
-        config["reconnect_every_seconds"],
-        config["bredr_rssi_proximity"],
-        config["bredr_rssi_lock_below"],
-    )
+def configured_bluetooth_presence(config: dict[str, Any], seconds: float = 10.0) -> BluetoothPresenceSample:
+    presence = create_presence(config)
     try:
-        return presence.sample()
+        deadline = elapsed_seconds() + (seconds if config["proximity_mode"] == "ble" else 0)
+        while True:
+            sample = presence.sample()
+            if sample.present or elapsed_seconds() >= deadline:
+                return sample
+            time.sleep(min(0.1, max(0.0, deadline - elapsed_seconds())))
     finally:
         presence.stop()
+
+
+def observe(args: argparse.Namespace) -> int:
+    """Observe without grabbing, connecting, changing config, or arming anything."""
+    config = load_config(Path(args.config))
+    presence = create_presence(config)
+    seen_near = False
+    try:
+        deadline = elapsed_seconds() + args.seconds
+        while elapsed_seconds() < deadline:
+            sample = presence.sample()
+            seen_near = seen_near or sample.present
+            count = getattr(presence, "packet_count", "n/a")
+            print(f"{'NEAR' if sample.present else 'FAR'} RSSI={sample.rssi} updates={count}: {sample.reason}", flush=True)
+            time.sleep(min(1.0, max(0.0, deadline - elapsed_seconds())))
+    finally:
+        presence.stop()
+    return 0 if seen_near else 1
+
+
+def input_self_test_child(args: argparse.Namespace) -> int:
+    require_root("Input self-test")
+    config = load_config(Path(args.config))
+    grabber = InputGrabber(config["exclude_device_name_regex"])
+    with exclusive_input_session():
+        try:
+            grabber.grab_all()
+            if not grabber.is_grabbed:
+                raise SystemExit("Self-test failed: no physical input devices could be grabbed.")
+            deadline = elapsed_seconds() + args.seconds
+            while elapsed_seconds() < deadline:
+                grabber.discard_input()
+                time.sleep(0.05)
+        finally:
+            grabber.release_all()
+    print("Self-test passed; all test input grabs released.")
+    return 0
+
+
+def self_test(args: argparse.Namespace) -> int:
+    require_root("Input self-test")
+    load_config(Path(args.config))
+    if run_command(["systemctl", "is-active", "--quiet", APP_NAME], timeout=3.0).returncode == 0:
+        raise SystemExit("Disarm the running service before the input self-test.")
+    # The parent owns no evdev handles. If the child stalls, timeout kills it;
+    # the kernel then closes its descriptors and releases EVIOCGRAB.
+    print(f"Input self-test: automatic release after {args.seconds:g} seconds.", flush=True)
+    try:
+        result = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve()), "_input-self-test",
+             "--config", str(Path(args.config).resolve()), "--seconds", str(args.seconds)],
+            timeout=args.seconds + 5.0, check=False,
+        )
+    except subprocess.TimeoutExpired:
+        print("Self-test FAILED: timed out; test process killed and its input handles closed.")
+        return 1
+    return result.returncode
 
 
 def _raw_config(path: Path) -> dict[str, Any]:
@@ -2629,12 +3086,17 @@ def install(args: argparse.Namespace) -> int:
     require_root("Installation")
     if shutil.which("systemctl") is None:
         raise SystemExit("systemctl was not found; this installer requires systemd.")
-    if shutil.which("bluetoothctl") is None:
-        raise SystemExit("bluetoothctl was not found. Install BlueZ first.")
-
     existing_config = _raw_config(CONFIG_PATH)
-    existing_phone = existing_config.get("phone_address")
-    address = choose_phone(args.phone or (str(existing_phone) if existing_phone else None))
+    mode = args.mode or existing_config.get("proximity_mode", "bredr")
+    address = existing_config.get("phone_address", "")
+    if mode == "bredr":
+        if shutil.which("bluetoothctl") is None:
+            raise SystemExit("bluetoothctl was not found. Install BlueZ first.")
+        address = choose_phone(args.phone or (str(address) if address else None))
+    elif args.phone:
+        raise SystemExit("--phone selects a paired BR/EDR device; BLE uses --service-uuid.")
+    if mode == "ble" and args.force_start:
+        raise SystemExit("BLE installation stays disarmed. Use observe, self-test, then arm.")
 
     existing_wifi = existing_config.get("excluded_wifi_connections", [])
     if not isinstance(existing_wifi, list):
@@ -2660,11 +3122,18 @@ def install(args: argparse.Namespace) -> int:
         # upgrading an older installation, then preserve later user changes.
         wifi_exclusions = list(DEFAULT_WIFI_EXCLUSIONS)
 
-    source = Path(__file__).resolve()
-    atomic_write(INSTALL_PATH, source.read_bytes(), 0o755)
     config = DEFAULT_CONFIG.copy()
     config.update(existing_config)
+    config["proximity_mode"] = mode
     config["phone_address"] = address
+    for argument, key in (("service_uuid", "ble_service_uuid"), ("lock_rssi", "ble_lock_rssi_dbm"),
+                          ("unlock_rssi", "ble_unlock_rssi_dbm"), ("absence_seconds", "ble_absence_seconds"),
+                          ("adapter", "ble_adapter")):
+        value = getattr(args, argument)
+        if value is not None:
+            if mode != "ble":
+                raise SystemExit(f"--{argument.replace('_', '-')} requires --mode ble")
+            config[key] = value
     config["excluded_wifi_connections"] = wifi_exclusions
     config["wifi_policy_revision"] = WIFI_POLICY_REVISION
     config["locked_banner_template"] = PANEL_MARKER_TEXT
@@ -2678,8 +3147,14 @@ def install(args: argparse.Namespace) -> int:
     # This is an intentional policy update, so upgrade an existing 30-second
     # installation instead of allowing config.update() to retain the old value.
     config["rescue_window_seconds"] = 60.0
+    config = validate_config(config)
+    if mode == "ble":
+        BleAdvertisementPresence(config)  # Check the optional dependency before changing files.
+        run_command(["systemctl", "disable", "--now", APP_NAME], check=SERVICE_PATH.exists())
+        _remove_panel_marker()
+    source = Path(__file__).resolve()
+    atomic_write(INSTALL_PATH, source.read_bytes(), 0o755)
     write_config(CONFIG_PATH, config)
-    config = load_config(CONFIG_PATH)
     atomic_write(SERVICE_PATH, SYSTEMD_SERVICE.encode("utf-8"), 0o644)
     panel_installed, panel_enabled, panel_version, panel_user = (
         install_gnome_panel_extension()
@@ -2687,13 +3162,16 @@ def install(args: argparse.Namespace) -> int:
     run_command(["systemctl", "daemon-reload"], check=True)
 
     print(f"Installed {INSTALL_PATH}")
-    print(f"Configured phone {address}")
+    print(f"Configured {mode} proximity")
     if wifi_exclusions:
         print("Wi-Fi exclusions: " + ", ".join(wifi_exclusions))
     else:
         print("Wi-Fi exclusions: NONE (guard remains active on every network)")
     print("Battery power is not an activation or pause criterion.")
-    if config["bredr_rssi_proximity"]:
+    if mode == "ble":
+        print(f"BLE: lock <= {config['ble_lock_rssi_dbm']} dBm; unlock >= {config['ble_unlock_rssi_dbm']} dBm; "
+              f"absence {config['ble_absence_seconds']:g} seconds.")
+    elif config["bredr_rssi_proximity"]:
         print(
             "BR/EDR proximity: freeze immediately below RSSI "
             f"{config['bredr_rssi_lock_below']}; release at or above it."
@@ -2714,6 +3192,12 @@ def install(args: argparse.Namespace) -> int:
         print("REQUIRED ONCE: fully log out and back in so GNOME Shell loads the marker.")
     else:
         print("GNOME Shell was not detected; the floating marker fallback remains active.")
+
+    if mode == "ble":
+        print("BLE service installed and DISARMED. Validate before arming:")
+        for command in ("observe --seconds 90", "self-test --seconds 3", "arm", "check"):
+            print(f"  sudo {INSTALL_PATH} {command}")
+        return 0
 
     phone_sample = configured_bluetooth_presence(config)
     current_wifi = active_wifi_names()
@@ -2767,13 +3251,16 @@ def install(args: argparse.Namespace) -> int:
 def arm(args: argparse.Namespace) -> int:
     require_root("Arming")
     config = load_config(CONFIG_PATH)
-    phone_sample = configured_bluetooth_presence(config)
+    if config["proximity_mode"] == "ble" and args.force:
+        raise SystemExit("BLE arming requires a fresh near advertisement or an active Wi-Fi exclusion; --force is BR/EDR only.")
     wifi_matches = matching_wifi_exclusions(
         config["excluded_wifi_connections"], active_wifi_names()
     )
-    if not phone_sample.present and not wifi_matches and not args.force:
+    phone_sample = configured_bluetooth_presence(config) if not wifi_matches else None
+    if phone_sample is not None and not phone_sample.present and not args.force:
+        hint = "Bring the advertiser nearby and try again." if config["proximity_mode"] == "ble" else "Bring/connect it or use --force."
         raise SystemExit(
-            "Phone is not nearby; service not started. Bring/connect it or use --force. "
+            f"Phone is not nearby; service not started. {hint} "
             f"Detector: {phone_sample.reason}."
         )
     run_command(["systemctl", "enable", "--now", APP_NAME], check=True)
@@ -2809,7 +3296,7 @@ def configure_wifi(args: argparse.Namespace) -> int:
 
 def disarm(_args: argparse.Namespace) -> int:
     require_root("Disarming")
-    run_command(["systemctl", "disable", "--now", APP_NAME], check=False)
+    run_command(["systemctl", "disable", "--now", APP_NAME], check=True)
     _remove_panel_marker()
     print("Phone Input Guard is stopped and disabled; input is released.")
     return 0
@@ -2837,27 +3324,20 @@ def uninstall(_args: argparse.Namespace) -> int:
 def check_setup(args: argparse.Namespace) -> int:
     config_path = Path(args.config)
     config = load_config(config_path)
-    presence = BluezPresence(
-        config["phone_address"],
-        config["reconnect_every_seconds"],
-        config["bredr_rssi_proximity"],
-        config["bredr_rssi_lock_below"],
-    )
-    phone_sample = presence.sample()
-    presence.stop()
+    phone_sample = configured_bluetooth_presence(config)
     current_wifi = active_wifi_names()
     wifi_matches = matching_wifi_exclusions(
         config["excluded_wifi_connections"], current_wifi
     )
     wifi_paused = bool(wifi_matches)
-    print(f"Phone:   {config['phone_address']}")
-    print(f"Backend: {presence.backend}")
+    print(f"Mode:    {config['proximity_mode']}")
+    print(f"Backend: {BleAdvertisementPresence.backend if config['proximity_mode'] == 'ble' else 'BlueZ connection / BR/EDR RSSI'}")
     if wifi_paused:
         state = "PAUSED BY WI-FI / INPUT RELEASED"
     elif phone_sample.present:
         state = "ACTIVE / PHONE NEARBY / INPUT RELEASED"
     elif phone_sample.connected:
-        state = "ACTIVE / PHONE CONNECTED BUT DISTANT / INPUT WOULD FREEZE"
+        state = "ACTIVE / PHONE SIGNAL DISTANT / INPUT WOULD FREEZE"
     else:
         state = "ACTIVE / PHONE ABSENT / INPUT WOULD FREEZE"
     print(f"State:   {state}")
@@ -2865,8 +3345,10 @@ def check_setup(args: argparse.Namespace) -> int:
     if phone_sample.transport is not None:
         print(f"Transport: {phone_sample.transport}")
     if phone_sample.rssi is not None:
-        print(f"Connection RSSI: {phone_sample.rssi}")
-    if config["bredr_rssi_proximity"]:
+        print(f"RSSI: {phone_sample.rssi}")
+    if config["proximity_mode"] == "ble":
+        print(f"BLE thresholds: lock <= {config['ble_lock_rssi_dbm']} dBm; unlock >= {config['ble_unlock_rssi_dbm']} dBm")
+    elif config["bredr_rssi_proximity"]:
         print(
             "BR/EDR threshold: distant below "
             f"{config['bredr_rssi_lock_below']}; nearby at or above it"
@@ -2882,7 +3364,7 @@ def check_setup(args: argparse.Namespace) -> int:
     else:
         print("Wi-Fi exclusions: none")
     print("Battery activation criterion: NONE")
-    print("Absence grace: 0 seconds")
+    print(f"Advertisement-loss timeout: {config['ble_absence_seconds']:g} seconds" if config["proximity_mode"] == "ble" else "Absence grace: 0 seconds")
     print("Display: kept on while frozen; no screen lock, logout, or app pause")
     print(f"On-screen marker: {PANEL_MARKER_TEXT} (GNOME panel, top-left)")
     power_rescue = PowerCycleRescue(
@@ -2920,18 +3402,30 @@ def list_phones(_args: argparse.Namespace) -> int:
     return 0
 
 
+def duration_seconds(value: str, maximum: float) -> float:
+    seconds = float(value)
+    if not math.isfinite(seconds) or not 1 <= seconds <= maximum:
+        raise argparse.ArgumentTypeError(f"seconds must be finite and between 1 and {maximum:g}")
+    return seconds
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Instantly freeze Linux keyboard/mouse input when a paired Bluetooth "
-            "phone disconnects or its BR/EDR connection RSSI becomes distant, "
-            "without touching the display or desktop session."
+            "Freeze Linux keyboard/mouse input using BR/EDR connection proximity "
+            "or optional BLE advertisements, while keeping the desktop visible."
         )
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     install_parser = subparsers.add_parser("install", help="install the systemd service")
+    install_parser.add_argument("--mode", choices=("bredr", "ble"), help="default: retain existing mode, otherwise bredr")
+    install_parser.add_argument("--service-uuid", help="full 128-bit service UUID advertised by the phone (BLE)")
+    install_parser.add_argument("--lock-rssi", type=int, help="BLE weak threshold in dBm (default -84)")
+    install_parser.add_argument("--unlock-rssi", type=int, help="BLE strong threshold in dBm (default -80)")
+    install_parser.add_argument("--absence-seconds", type=float, help="BLE advertisement-loss timeout (default 11)")
+    install_parser.add_argument("--adapter", help="BLE adapter, e.g. hci0; default: automatic")
     install_parser.add_argument(
         "--phone", metavar="MAC", help="paired phone Bluetooth address"
     )
@@ -2964,7 +3458,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     arm_parser = subparsers.add_parser("arm", help="enable and start the service")
     arm_parser.add_argument(
-        "--force", action="store_true", help="start while the phone is absent/distant"
+        "--force", action="store_true", help="BR/EDR only: start while the phone is absent/distant"
     )
     arm_parser.set_defaults(function=arm)
 
@@ -3008,6 +3502,17 @@ def build_parser() -> argparse.ArgumentParser:
     check_parser = subparsers.add_parser("check", help="check phone state and input devices")
     check_parser.add_argument("--config", default=str(CONFIG_PATH))
     check_parser.set_defaults(function=check_setup)
+
+    observe_parser = subparsers.add_parser("observe", help="observe proximity without suppressing input or arming")
+    observe_parser.add_argument("--config", default=str(CONFIG_PATH))
+    observe_parser.add_argument("--seconds", type=lambda value: duration_seconds(value, 3600), default=90.0)
+    observe_parser.set_defaults(function=observe)
+
+    for name, function in (("self-test", self_test), ("_input-self-test", input_self_test_child)):
+        test_parser = subparsers.add_parser(name, help="bounded physical input test (disarm first)" if name == "self-test" else argparse.SUPPRESS)
+        test_parser.add_argument("--config", default=str(CONFIG_PATH))
+        test_parser.add_argument("--seconds", type=lambda value: duration_seconds(value, 5), default=3.0)
+        test_parser.set_defaults(function=function)
 
     list_parser = subparsers.add_parser("list-phones", help="list paired Bluetooth devices")
     list_parser.set_defaults(function=list_phones)

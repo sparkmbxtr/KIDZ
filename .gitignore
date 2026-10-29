@@ -3,3 +3,6 @@ __pycache__/
 *.log
 .DS_Store
 Thumbs.db
+*.local.json
+/phone-input-guard.json
+/observations/

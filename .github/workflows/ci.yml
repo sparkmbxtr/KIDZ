@@ -1,4 +1,4 @@
-name: Syntax checks
+name: Guard checks
 
 on:
   push:
@@ -10,10 +10,38 @@ permissions:
 jobs:
   linux-python:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ['3.10', '3.12', '3.14']
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
       - name: Compile Python source
         run: python3 -m py_compile phone-input-guard.py
+      - name: Simulate Linux proximity and input recovery (no hardware or root)
+        run: python3 -m unittest discover -s tests -v
+
+  linux-bluez-api:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        dependency: ['dbus-fast==2.21.1', 'dbus-fast==4.0.0', 'dbus-fast']
+    env:
+      KIDZ_REQUIRE_PRIVATE_BUS: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install D-Bus binding (Ubuntu 24.04 baseline, 26.04 baseline, latest)
+        run: python3 -m pip install '${{ matrix.dependency }}'
+      - name: Require private bus and exercise BlueZ protocol plus all simulations
+        run: |
+          command -v dbus-daemon
+          python3 -c 'import dbus_fast'
+          python3 -m unittest discover -s tests -v
 
   windows-native-helper:
     runs-on: ubuntu-latest
