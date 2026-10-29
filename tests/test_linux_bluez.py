@@ -91,21 +91,9 @@ class BluezSignalTests(unittest.TestCase):
 HAS_BINDING = importlib.util.find_spec("dbus_fast") is not None
 HAS_DBUS = HAS_BINDING and shutil.which("dbus-daemon") is not None
 if HAS_BINDING:
-    from dbus_fast import Message, MessageType, Variant
+    from dbus_fast import Message, MessageType, PropertyAccess, Variant
     from dbus_fast.aio import MessageBus
-    from dbus_fast.service import ServiceInterface, method
-
-    class SimulatedManager(ServiceInterface):
-        def __init__(self):
-            super().__init__(OBJECT_MANAGER)
-
-        @method()
-        def GetManagedObjects(self) -> 'a{oa{sa{sv}}}':
-            return {
-                ADAPTER: {"org.bluez.Adapter1": {"Powered": Variant("b", True)}},
-                # Even a cached strong RSSI must not count as a new observation.
-                DEVICE: {"org.bluez.Device1": {"UUIDs": Variant("as", [UUID]), "RSSI": Variant("n", -70)}},
-            }
+    from dbus_fast.service import ServiceInterface, dbus_property, method
 
     class SimulatedAdapter(ServiceInterface):
         def __init__(self):
@@ -113,6 +101,10 @@ if HAS_BINDING:
             self.filters = None
             self.started = False
             self.stopped = False
+
+        @dbus_property(access=PropertyAccess.READ)
+        def Powered(self) -> 'b':
+            return True
 
         @method()
         def SetDiscoveryFilter(self, filters: 'a{sv}'):
@@ -125,6 +117,18 @@ if HAS_BINDING:
         @method()
         def StopDiscovery(self):
             self.stopped = True
+
+    class SimulatedDevice(ServiceInterface):
+        def __init__(self):
+            super().__init__("org.bluez.Device1")
+
+        @dbus_property(access=PropertyAccess.READ)
+        def UUIDs(self) -> 'as':
+            return [UUID]
+
+        @dbus_property(access=PropertyAccess.READ)
+        def RSSI(self) -> 'n':
+            return -70
 
 
 @unittest.skipUnless(HAS_BINDING, "optional D-Bus binding required")
@@ -176,6 +180,12 @@ class BindingContractTests(unittest.IsolatedAsyncioTestCase):
             await self.scanner.stop()
         self.bus.disconnect.assert_called_once()
 
+    async def test_fixture_exports_properties_for_automatic_object_manager(self):
+        # dbus-fast handles GetManagedObjects itself, using exported properties.
+        # A method-only fixture would silently return an adapter without Powered.
+        self.assertEqual({prop.name: prop.signature for prop in SimulatedAdapter().introspect().properties}, {"Powered": "b"})
+        self.assertEqual({prop.name: prop.signature for prop in SimulatedDevice().introspect().properties}, {"UUIDs": "as", "RSSI": "n"})
+
 
 @unittest.skipUnless(HAS_DBUS, "optional dbus-fast and private dbus-daemon needed (dedicated CI job installs both)")
 class PrivateBusTests(unittest.IsolatedAsyncioTestCase):
@@ -195,8 +205,9 @@ class PrivateBusTests(unittest.IsolatedAsyncioTestCase):
         self.service_bus = await MessageBus(bus_address=address).connect()
         await self.service_bus.request_name("org.bluez")
         self.adapter = SimulatedAdapter()
-        self.service_bus.export("/", SimulatedManager())
+        # The binding supplies ObjectManager from the real exported interfaces.
         self.service_bus.export(ADAPTER, self.adapter)
+        self.service_bus.export(DEVICE, SimulatedDevice())
         self.callback = mock.Mock()
         self.scanner = guard.BluezAdvertisementScanner(self.callback, [UUID], {"adapter": "hci0"})
         self.addAsyncCleanup(self.disconnect)
